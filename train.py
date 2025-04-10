@@ -1,6 +1,7 @@
 import os
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
@@ -13,8 +14,10 @@ from datetime import datetime
 from pathlib import Path
 
 from dataset import create_dataloaders
-from mobile_sam import setup_model
-from lora import MobileSAM_LoRA
+# Use the official MobileSAM registry
+from mobile_sam import sam_model_registry
+# Import the adapted LoRA wrapper
+from lora import MobileSAM_LoRA_Adapted
 
 # Loss functions
 class DiceLoss(nn.Module):
@@ -23,33 +26,27 @@ class DiceLoss(nn.Module):
         self.smooth = smooth
     
     def forward(self, pred, target):
-        """
-        pred: (B, C, H, W) - predicted masks
-        target: (B, H, W) - ground truth instance segmentation mask
-        """
-        # Convert instance segmentation to binary segmentation
-        # If mask > 0, it's foreground
         binary_target = (target > 0).float()
-        
-        # Convert to one-hot if the pred is multi-class
+        # Handle cases where pred might be None (e.g., error during forward)
+        if pred is None:
+             print("Warning: DiceLoss received None prediction.")
+             return torch.tensor(1.0, device=target.device) # Return max loss
+             
         if pred.shape[1] > 1:
-            pred = torch.sigmoid(pred)
-            pred = pred[:, 0, :, :]  # Take only the first mask
+            # Assuming the first channel is the foreground mask
+            pred = torch.sigmoid(pred[:, 0, :, :]) 
         else:
             pred = torch.sigmoid(pred.squeeze(1))
+            
+        pred_flat = pred.view(pred.size(0), -1)
+        target_flat = binary_target.view(target.size(0), -1)
         
-        # Flatten the tensors
-        pred_flat = pred.view(-1)
-        target_flat = binary_target.view(-1)
-        
-        # Calculate Dice coefficient
-        intersection = (pred_flat * target_flat).sum()
-        union = pred_flat.sum() + target_flat.sum()
+        intersection = (pred_flat * target_flat).sum(1)
+        union = pred_flat.sum(1) + target_flat.sum(1)
         
         dice = (2. * intersection + self.smooth) / (union + self.smooth)
         
-        return 1 - dice
-
+        return (1 - dice).mean() # Average loss over batch
 
 class FocalLoss(nn.Module):
     def __init__(self, alpha=0.25, gamma=2.0, reduction='mean'):
@@ -59,30 +56,32 @@ class FocalLoss(nn.Module):
         self.reduction = reduction
     
     def forward(self, pred, target):
-        """
-        pred: (B, C, H, W) - predicted masks
-        target: (B, H, W) - ground truth instance segmentation mask
-        """
-        # Convert instance segmentation to binary segmentation
         binary_target = (target > 0).float()
         
-        # Convert to one-hot if the pred is multi-class
+        if pred is None:
+             print("Warning: FocalLoss received None prediction.")
+             # Return a high loss value or handle appropriately
+             return torch.tensor(10.0, device=target.device) 
+
         if pred.shape[1] > 1:
-            pred = torch.sigmoid(pred)
-            pred = pred[:, 0, :, :]  # Take only the first mask
+            pred = torch.sigmoid(pred[:, 0, :, :]) 
         else:
             pred = torch.sigmoid(pred.squeeze(1))
-        
-        # Focal loss computation
+            
         binary_target = binary_target.view(-1)
         pred = pred.view(-1)
         
-        # Apply sigmoid to get probabilities
+        # Ensure pred is clamped to avoid log(0)
+        eps = 1e-8
+        pred = torch.clamp(pred, eps, 1. - eps)
+        
         pt = pred * binary_target + (1 - pred) * (1 - binary_target)
         alpha_factor = self.alpha * binary_target + (1 - self.alpha) * (1 - binary_target)
         modulating_factor = (1.0 - pt) ** self.gamma
         
-        loss = -alpha_factor * modulating_factor * torch.log(pt + 1e-8)
+        # Use Binary Cross Entropy loss calculation format for numerical stability
+        bce_loss = F.binary_cross_entropy(pred, binary_target, reduction='none')
+        loss = alpha_factor * modulating_factor * bce_loss
         
         if self.reduction == 'mean':
             return loss.mean()
@@ -90,7 +89,6 @@ class FocalLoss(nn.Module):
             return loss.sum()
         else:
             return loss
-
 
 # Combined loss
 class CombinedLoss(nn.Module):
@@ -102,111 +100,192 @@ class CombinedLoss(nn.Module):
         self.focal_loss = FocalLoss(alpha, gamma)
     
     def forward(self, pred, target):
+        if pred is None:
+             print("Warning: CombinedLoss received None prediction.")
+             # Return a combined high loss value
+             return torch.tensor(11.0, device=target.device) 
+             
         dice = self.dice_loss(pred, target)
         focal = self.focal_loss(pred, target)
         return self.dice_weight * dice + self.focal_weight * focal
 
-
 # Evaluation metrics
 def calculate_metrics(pred, target, threshold=0.5):
-    """
-    Calculate IoU and Dice score for binary segmentation
-    
-    Args:
-        pred (torch.Tensor): Predicted mask (B, 1, H, W) or (B, H, W)
-        target (torch.Tensor): Target mask (B, H, W)
-        threshold (float): Threshold for binarizing predictions
-    
-    Returns:
-        dict: Dictionary containing IoU and Dice scores
-    """
-    if pred.shape[1] > 1:
-        pred = pred[:, 0, :, :]  # Take only the first mask
-    else:
-        pred = pred.squeeze(1)
-    
-    pred = (pred > threshold).float()
-    binary_target = (target > 0).float()
-    
-    # Compute intersection and union
-    intersection = (pred * binary_target).sum(dim=(1, 2))
-    union = pred.sum(dim=(1, 2)) + binary_target.sum(dim=(1, 2)) - intersection
-    
-    # Calculate IoU
-    iou = (intersection + 1e-8) / (union + 1e-8)
-    mean_iou = iou.mean().item()
-    
-    # Calculate Dice score
-    dice = (2 * intersection + 1e-8) / (pred.sum(dim=(1, 2)) + binary_target.sum(dim=(1, 2)) + 1e-8)
-    mean_dice = dice.mean().item()
-    
-    return {
-        'IoU': mean_iou,
-        'Dice': mean_dice
-    }
+    if pred is None or target is None:
+        # print("Warning: calculate_metrics received None input.")
+        return {'IoU': 0.0, 'Dice': 0.0}
+    with torch.no_grad(): # Ensure no gradients are calculated here
+         if pred.shape[1] > 1:
+             pred = pred[:, 0, :, :] # Select first channel
+         else:
+             pred = pred.squeeze(1)
+         # Apply sigmoid and threshold
+         pred = (torch.sigmoid(pred) > threshold).float()
+         binary_target = (target > 0).float()
+         
+         # Flatten for calculation
+         pred_flat = pred.view(pred.size(0), -1)
+         target_flat = binary_target.view(target.size(0), -1)
+         
+         intersection = (pred_flat * target_flat).sum(1)
+         pred_sum = pred_flat.sum(1)
+         target_sum = target_flat.sum(1)
+         union = pred_sum + target_sum - intersection
+         
+         iou = (intersection + 1e-8) / (union + 1e-8)
+         dice = (2 * intersection + 1e-8) / (pred_sum + target_sum + 1e-8)
+         
+         # Handle potential division by zero if both pred and target are empty
+         iou[union == 0] = 1.0
+         dice[pred_sum + target_sum == 0] = 1.0
+         
+         mean_iou = iou.mean().item()
+         mean_dice = dice.mean().item()
+         
+    return {'IoU': mean_iou, 'Dice': mean_dice}
 
+def train_one_epoch(model, train_loader, criterion, optimizer, device, epoch, total_epochs, grad_clip=1.0):
+    model.train()
+    epoch_loss = 0.0
+    epoch_metrics = {'IoU': 0.0, 'Dice': 0.0}
+    num_batches = len(train_loader)
+    train_progress = tqdm(train_loader, desc=f"Epoch {epoch+1}/{total_epochs} [Train]")
+    
+    for batch in train_progress:
+        images = batch['image'].to(device)
+        masks = batch['mask'].to(device)
+        
+        optimizer.zero_grad()
+        
+        outputs, _ = model(images) # Forward pass using the LoRA wrapped model
+        
+        if outputs is None:
+            print(f"Warning: Model output is None in epoch {epoch+1}, batch. Skipping.")
+            continue
+        
+        loss = criterion(outputs, masks)
+        
+        # Check for NaN loss
+        if torch.isnan(loss):
+            print(f"Warning: NaN loss detected in epoch {epoch+1}, batch. Skipping update.")
+            # Consider logging inputs/outputs here for debugging
+            continue
+            
+        loss.backward()
+        
+        if grad_clip > 0:
+            torch.nn.utils.clip_grad_norm_(filter(lambda p: p.requires_grad, model.parameters()), grad_clip)
+
+        optimizer.step()
+        
+        epoch_loss += loss.item()
+        # Detach outputs for metrics calculation
+        batch_metrics = calculate_metrics(outputs.detach(), masks)
+        epoch_metrics['IoU'] += batch_metrics['IoU']
+        epoch_metrics['Dice'] += batch_metrics['Dice']
+        
+        train_progress.set_postfix({
+            'loss': f"{loss.item():.4f}",
+            'dice': f"{batch_metrics['Dice']:.4f}"
+        })
+    
+    avg_loss = epoch_loss / num_batches
+    avg_metrics = {k: v / num_batches for k, v in epoch_metrics.items()}
+    return avg_loss, avg_metrics
+
+def validate_one_epoch(model, val_loader, criterion, device):
+    model.eval()
+    epoch_loss = 0.0
+    epoch_metrics = {'IoU': 0.0, 'Dice': 0.0}
+    num_batches = len(val_loader)
+    val_progress = tqdm(val_loader, desc="[Val]", leave=False)
+    
+    with torch.no_grad():
+        for batch in val_progress:
+            images = batch['image'].to(device)
+            masks = batch['mask'].to(device)
+            
+            outputs, _ = model(images)
+            
+            if outputs is None:
+                 print("Warning: Model output is None during validation, skipping batch.")
+                 continue
+                 
+            loss = criterion(outputs, masks)
+            
+            epoch_loss += loss.item()
+            batch_metrics = calculate_metrics(outputs, masks)
+            epoch_metrics['IoU'] += batch_metrics['IoU']
+            epoch_metrics['Dice'] += batch_metrics['Dice']
+            
+            val_progress.set_postfix({
+                'loss': f"{loss.item():.4f}",
+                'dice': f"{batch_metrics['Dice']:.4f}"
+            })
+            
+    avg_loss = epoch_loss / num_batches
+    avg_metrics = {k: v / num_batches for k, v in epoch_metrics.items()}
+    return avg_loss, avg_metrics
 
 def train(args):
-    """
-    Main training function
-    """
-    # Create directory for saving checkpoints and logs
     save_dir = Path(args.output_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
+    log_dir = save_dir / 'logs'
+    log_dir.mkdir(exist_ok=True)
+    writer = SummaryWriter(log_dir=str(log_dir))
     
-    # Set up TensorBoard writer
-    writer = SummaryWriter(log_dir=os.path.join(args.output_dir, 'logs'))
-    
-    # Save training args
-    with open(os.path.join(args.output_dir, 'args.json'), 'w') as f:
+    # Save args
+    with open(save_dir / 'args.json', 'w') as f:
         json.dump(vars(args), f, indent=4)
     
-    # Set device
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
-    
-    # Create data loaders
+
+    # Dataloaders
     train_loader, val_loader, test_loader = create_dataloaders(
         root_dir=args.data_dir,
         batch_size=args.batch_size,
         image_size=args.image_size,
-        num_workers=args.num_workers
+        num_workers=args.num_workers,
+        seed=args.seed # Pass seed to dataloader creation
     )
     
-    # Load pre-trained model
-    if args.pretrained:
-        model = setup_model(args.pretrained)
-        print(f"Loaded pre-trained model from {args.pretrained}")
-    else:
-        model = setup_model()
-        print("Using model without pre-trained weights")
-    
-    # Apply LoRA
-    lora_model = MobileSAM_LoRA(
-        model=model,
+    # Load base official model
+    model_type = "vit_t"
+    base_model = sam_model_registry[model_type](checkpoint=args.pretrained)
+    print(f"Loaded official MobileSAM model (type: {model_type}) from {args.pretrained}")
+    base_model = base_model.to(device)
+
+    # Apply LoRA using the adapted wrapper
+    # Ensure use_temp_head is True if not fine-tuning original decoder
+    use_temp_head = not args.train_decoder 
+    lora_model = MobileSAM_LoRA_Adapted(
+        model=base_model,
         r=args.lora_rank,
         lora_alpha=args.lora_alpha,
         lora_dropout=args.lora_dropout,
         train_encoder=args.train_encoder,
-        train_decoder=args.train_decoder
-    )
-    
-    # Move model to device
-    lora_model = lora_model.to(device)
-    
-    # Define loss function and optimizer
-    criterion = CombinedLoss(
-        dice_weight=args.dice_weight,
-        focal_weight=args.focal_weight
-    )
+        train_decoder=args.train_decoder,
+        use_temp_head=use_temp_head
+    ).to(device)
+
+    criterion = CombinedLoss(dice_weight=args.dice_weight, focal_weight=args.focal_weight)
     
     # Get trainable parameters
     if args.train_only_lora:
-        trainable_params = lora_model.get_trainable_parameters()
+        print("Configuring optimizer for LoRA parameters and segmentation head...")
+        trainable_params = lora_model.get_trainable_parameters() # Gets LoRA + Head params
     else:
-        trainable_params = lora_model.parameters()
-    
-    # Create optimizer
+        print("Configuring optimizer for all trainable parameters (likely full model fine-tuning)...")
+        # This would typically involve unfreezing parts of the base_model *before* wrapping
+        # For simplicity, this mode currently trains the same as train_only_lora
+        # If full finetuning is desired, the MobileSAM_LoRA_Adapted needs modification
+        # or training should use `base_model` directly without the LoRA wrapper.
+        trainable_params = filter(lambda p: p.requires_grad, lora_model.parameters())
+        # Print count again to confirm
+        lora_model.get_trainable_parameters()
+
+    # Optimizer
     if args.optimizer == 'adam':
         optimizer = optim.Adam(trainable_params, lr=args.learning_rate, weight_decay=args.weight_decay)
     elif args.optimizer == 'adamw':
@@ -214,106 +293,39 @@ def train(args):
     else:
         optimizer = optim.SGD(trainable_params, lr=args.learning_rate, momentum=0.9, weight_decay=args.weight_decay)
     
-    # Learning rate scheduler
+    # Scheduler
+    scheduler = None
     if args.lr_scheduler == 'cosine':
         scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=args.min_lr)
     elif args.lr_scheduler == 'step':
         scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=args.lr_step_size, gamma=args.lr_gamma)
     elif args.lr_scheduler == 'reduce':
-        scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode='min', factor=args.lr_gamma, patience=args.lr_patience, verbose=True
-        )
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=args.lr_gamma, patience=args.lr_patience, verbose=True)
     
-    # Track best validation metrics
     best_val_loss = float('inf')
     best_val_dice = 0.0
     best_epoch = 0
     num_epochs_no_improvement = 0
     
-    # Training loop
     print(f"Starting training for {args.epochs} epochs...")
+    start_time = time.time()
+    
     for epoch in range(args.epochs):
-        # Training phase
-        lora_model.train()
-        train_loss = 0.0
-        train_metrics = {'IoU': 0.0, 'Dice': 0.0}
+        epoch_start_time = time.time()
         
-        train_progress = tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs} [Train]")
-        for batch_idx, batch in enumerate(train_progress):
-            images = batch['image'].to(device)
-            masks = batch['mask'].to(device)
-            
-            # Zero the gradients
-            optimizer.zero_grad()
-            
-            # Forward pass
-            outputs, _ = lora_model(images)
-            loss = criterion(outputs, masks)
-            
-            # Backward pass and optimize
-            loss.backward()
-            
-            if args.grad_clip > 0:
-                torch.nn.utils.clip_grad_norm_(trainable_params, args.grad_clip)
-                
-            optimizer.step()
-            
-            # Update train loss and metrics
-            train_loss += loss.item()
-            batch_metrics = calculate_metrics(outputs.detach(), masks)
-            train_metrics['IoU'] += batch_metrics['IoU']
-            train_metrics['Dice'] += batch_metrics['Dice']
-            
-            # Update progress bar
-            train_progress.set_postfix({
-                'loss': loss.item(),
-                'dice': batch_metrics['Dice']
-            })
+        train_loss, train_metrics = train_one_epoch(lora_model, train_loader, criterion, optimizer, device, epoch, args.epochs, args.grad_clip)
+        val_loss, val_metrics = validate_one_epoch(lora_model, val_loader, criterion, device)
         
-        # Calculate average training metrics
-        train_loss /= len(train_loader)
-        train_metrics['IoU'] /= len(train_loader)
-        train_metrics['Dice'] /= len(train_loader)
+        epoch_duration = time.time() - epoch_start_time
         
-        # Validation phase
-        lora_model.eval()
-        val_loss = 0.0
-        val_metrics = {'IoU': 0.0, 'Dice': 0.0}
+        # Scheduler step logic
+        if scheduler:
+            if args.lr_scheduler == 'reduce':
+                scheduler.step(val_metrics['Dice']) # ReduceLROnPlateau often tracks validation metric
+            else:
+                scheduler.step()
         
-        with torch.no_grad():
-            val_progress = tqdm(val_loader, desc=f"Epoch {epoch+1}/{args.epochs} [Val]")
-            for batch_idx, batch in enumerate(val_progress):
-                images = batch['image'].to(device)
-                masks = batch['mask'].to(device)
-                
-                # Forward pass
-                outputs, _ = lora_model(images)
-                loss = criterion(outputs, masks)
-                
-                # Update validation loss and metrics
-                val_loss += loss.item()
-                batch_metrics = calculate_metrics(outputs, masks)
-                val_metrics['IoU'] += batch_metrics['IoU']
-                val_metrics['Dice'] += batch_metrics['Dice']
-                
-                # Update progress bar
-                val_progress.set_postfix({
-                    'loss': loss.item(),
-                    'dice': batch_metrics['Dice']
-                })
-        
-        # Calculate average validation metrics
-        val_loss /= len(val_loader)
-        val_metrics['IoU'] /= len(val_loader)
-        val_metrics['Dice'] /= len(val_loader)
-        
-        # Update learning rate scheduler
-        if args.lr_scheduler == 'reduce':
-            scheduler.step(val_loss)
-        else:
-            scheduler.step()
-        
-        # Log metrics to TensorBoard
+        # Logging
         writer.add_scalar('Loss/train', train_loss, epoch)
         writer.add_scalar('Loss/val', val_loss, epoch)
         writer.add_scalar('IoU/train', train_metrics['IoU'], epoch)
@@ -321,37 +333,32 @@ def train(args):
         writer.add_scalar('Dice/train', train_metrics['Dice'], epoch)
         writer.add_scalar('Dice/val', val_metrics['Dice'], epoch)
         writer.add_scalar('LR', optimizer.param_groups[0]['lr'], epoch)
+        writer.add_scalar('Time/epoch', epoch_duration, epoch)
         
-        # Print epoch summary
-        print(f"Epoch {epoch+1}/{args.epochs} - "
-              f"Train Loss: {train_loss:.4f}, "
-              f"Train Dice: {train_metrics['Dice']:.4f}, "
-              f"Val Loss: {val_loss:.4f}, "
-              f"Val Dice: {val_metrics['Dice']:.4f}")
+        print(f"Epoch {epoch+1}/{args.epochs} [{epoch_duration:.2f}s] - Train Loss: {train_loss:.4f}, Train Dice: {train_metrics['Dice']:.4f}, Val Loss: {val_loss:.4f}, Val Dice: {val_metrics['Dice']:.4f}, LR: {optimizer.param_groups[0]['lr']:.6f}")
         
-        # Check if this is the best model based on validation Dice score
+        # Checkpointing and Early Stopping
         if val_metrics['Dice'] > best_val_dice:
             best_val_dice = val_metrics['Dice']
             best_val_loss = val_loss
             best_epoch = epoch
             num_epochs_no_improvement = 0
-            
-            # Save best model
+            # Save the best model state dictionary
             torch.save({
                 'epoch': epoch,
-                'model_state_dict': lora_model.state_dict(),
+                'model_state_dict': lora_model.state_dict(), 
                 'optimizer_state_dict': optimizer.state_dict(),
                 'val_loss': val_loss,
                 'val_dice': val_metrics['Dice'],
                 'val_iou': val_metrics['IoU'],
                 'args': vars(args)
-            }, os.path.join(args.output_dir, 'best_model.pth'))
-            
-            print(f"Saved best model with Dice: {best_val_dice:.4f}")
+            }, save_dir / 'best_model.pth')
+            print(f"---> Saved best model (Epoch {epoch+1}) with Val Dice: {best_val_dice:.4f}")
         else:
             num_epochs_no_improvement += 1
+            print(f"---> No improvement in Val Dice for {num_epochs_no_improvement} epochs.")
             
-        # Save checkpoint every save_interval epochs
+        # Save periodic checkpoint
         if (epoch + 1) % args.save_interval == 0:
             torch.save({
                 'epoch': epoch,
@@ -361,124 +368,116 @@ def train(args):
                 'val_dice': val_metrics['Dice'],
                 'val_iou': val_metrics['IoU'],
                 'args': vars(args)
-            }, os.path.join(args.output_dir, f'checkpoint_epoch_{epoch+1}.pth'))
+            }, save_dir / f'checkpoint_epoch_{epoch+1}.pth')
+            print(f"---> Saved checkpoint at epoch {epoch+1}")
         
-        # Early stopping
+        # Early stopping check
         if args.early_stopping and num_epochs_no_improvement >= args.patience:
-            print(f"Early stopping after {num_epochs_no_improvement} epochs without improvement.")
+            print(f"Early stopping triggered after {args.patience} epochs without improvement.")
             break
     
-    # Final evaluation on test set
-    lora_model.eval()
-    test_loss = 0.0
-    test_metrics = {'IoU': 0.0, 'Dice': 0.0}
+    total_training_time = time.time() - start_time
+    print(f"\nTotal Training Time: {total_training_time:.2f}s")
     
-    with torch.no_grad():
-        test_progress = tqdm(test_loader, desc="Testing")
-        for batch_idx, batch in enumerate(test_progress):
-            images = batch['image'].to(device)
-            masks = batch['mask'].to(device)
-            
-            # Forward pass
-            outputs, _ = lora_model(images)
-            loss = criterion(outputs, masks)
-            
-            # Update test loss and metrics
-            test_loss += loss.item()
-            batch_metrics = calculate_metrics(outputs, masks)
-            test_metrics['IoU'] += batch_metrics['IoU']
-            test_metrics['Dice'] += batch_metrics['Dice']
-            
-            # Update progress bar
-            test_progress.set_postfix({
-                'loss': loss.item(),
-                'dice': batch_metrics['Dice']
-            })
-    
-    # Calculate average test metrics
-    test_loss /= len(test_loader)
-    test_metrics['IoU'] /= len(test_loader)
-    test_metrics['Dice'] /= len(test_loader)
-    
-    # Print final test results
-    print(f"Test Loss: {test_loss:.4f}, "
-          f"Test IoU: {test_metrics['IoU']:.4f}, "
-          f"Test Dice: {test_metrics['Dice']:.4f}")
-    
-    # Log test metrics
-    with open(os.path.join(args.output_dir, 'test_results.json'), 'w') as f:
-        json.dump({
+    # Final test evaluation using the best saved model
+    print("\nLoading best model for final test evaluation...")
+    best_model_path = save_dir / 'best_model.pth'
+    if best_model_path.exists():
+        checkpoint = torch.load(best_model_path, map_location=device)
+        # Recreate model structure based on saved args
+        saved_args = argparse.Namespace(**checkpoint['args']) 
+        base_model_test = sam_model_registry[model_type](checkpoint=None).to(device) # Load architecture
+        lora_model_test = MobileSAM_LoRA_Adapted(
+             model=base_model_test,
+             r=saved_args.lora_rank, 
+             lora_alpha=saved_args.lora_alpha,
+             lora_dropout=0.0, # No dropout for eval
+             train_encoder=saved_args.train_encoder,
+             train_decoder=saved_args.train_decoder,
+             use_temp_head=not saved_args.train_decoder
+        ).to(device)
+        lora_model_test.load_state_dict(checkpoint['model_state_dict'])
+        print(f"Loaded best model from epoch {checkpoint['epoch']+1}")
+        
+        test_loss, test_metrics = validate_one_epoch(lora_model_test, test_loader, criterion, device)
+        
+        print(f"\nFinal Test Results (using best model from epoch {checkpoint['epoch']+1}):")
+        print(f"  Test Loss: {test_loss:.4f}")
+        print(f"  Test IoU:  {test_metrics['IoU']:.4f}")
+        print(f"  Test Dice: {test_metrics['Dice']:.4f}")
+        
+        results_data = {
             'test_loss': test_loss,
             'test_iou': test_metrics['IoU'],
             'test_dice': test_metrics['Dice'],
-            'best_epoch': best_epoch,
+            'best_epoch': best_epoch + 1, # 1-based index
             'best_val_loss': best_val_loss,
-            'best_val_dice': best_val_dice
-        }, f, indent=4)
+            'best_val_dice': best_val_dice,
+            'total_training_time_seconds': total_training_time
+        }
+    else:
+        print("Error: Best model checkpoint not found. Skipping test evaluation.")
+        results_data = {"error": "Best model checkpoint not found"}
+
+    with open(save_dir / 'test_results.json', 'w') as f:
+        json.dump(results_data, f, indent=4)
     
-    # Close TensorBoard writer
     writer.close()
-    
-    print(f"Training completed. Best model saved at epoch {best_epoch+1} with Dice: {best_val_dice:.4f}")
-    
-    return best_val_dice, test_metrics['Dice']
+    print(f"\nTraining completed. Best model saved at epoch {best_epoch+1} with Val Dice: {best_val_dice:.4f}")
+    print(f"Results and logs saved in: {save_dir}")
+    return best_val_dice, results_data.get('test_dice', 0.0)
 
-
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='Train MobileSAM with LoRA on NuInsSeg dataset')
-    
-    # Dataset parameters
-    parser.add_argument('--data_dir', type=str, default='NuInsSeg', help='Path to NuInsSeg dataset')
-    parser.add_argument('--image_size', type=int, default=1024, help='Input image size')
-    parser.add_argument('--num_workers', type=int, default=4, help='Number of data loading workers')
-    
-    # Model parameters
-    parser.add_argument('--pretrained', type=str, default=None, help='Path to pre-trained MobileSAM model')
-    parser.add_argument('--train_encoder', action='store_true', help='Train the image encoder')
-    parser.add_argument('--train_decoder', action='store_true', help='Train the mask decoder')
-    parser.add_argument('--train_only_lora', action='store_true', help='Train only LoRA parameters')
-    
-    # LoRA parameters
-    parser.add_argument('--lora_rank', type=int, default=4, help='Rank of LoRA adaptation')
-    parser.add_argument('--lora_alpha', type=int, default=4, help='Alpha scaling factor for LoRA')
-    parser.add_argument('--lora_dropout', type=float, default=0.1, help='Dropout probability for LoRA layers')
-    
-    # Training parameters
-    parser.add_argument('--batch_size', type=int, default=4, help='Training batch size')
-    parser.add_argument('--epochs', type=int, default=100, help='Number of training epochs')
-    parser.add_argument('--learning_rate', type=float, default=1e-4, help='Initial learning rate')
-    parser.add_argument('--min_lr', type=float, default=1e-6, help='Minimum learning rate')
-    parser.add_argument('--weight_decay', type=float, default=1e-4, help='Weight decay')
-    parser.add_argument('--optimizer', type=str, default='adamw', choices=['adam', 'adamw', 'sgd'], help='Optimizer')
-    parser.add_argument('--lr_scheduler', type=str, default='cosine', choices=['cosine', 'step', 'reduce'], help='LR scheduler')
-    parser.add_argument('--lr_step_size', type=int, default=30, help='Step size for StepLR scheduler')
-    parser.add_argument('--lr_gamma', type=float, default=0.1, help='Gamma for StepLR scheduler')
-    parser.add_argument('--lr_patience', type=int, default=10, help='Patience for ReduceLROnPlateau scheduler')
-    parser.add_argument('--grad_clip', type=float, default=1.0, help='Gradient clipping')
-    
-    # Loss parameters
-    parser.add_argument('--dice_weight', type=float, default=0.5, help='Weight for Dice loss')
-    parser.add_argument('--focal_weight', type=float, default=0.5, help='Weight for Focal loss')
-    
-    # Other parameters
-    parser.add_argument('--output_dir', type=str, default='output', help='Directory to save checkpoints and logs')
-    parser.add_argument('--save_interval', type=int, default=10, help='Epochs between checkpoint saves')
-    parser.add_argument('--early_stopping', action='store_true', help='Enable early stopping')
-    parser.add_argument('--patience', type=int, default=20, help='Patience for early stopping')
-    parser.add_argument('--seed', type=int, default=42, help='Random seed')
-    
-    args = parser.parse_args()
-    
-    # Set random seed for reproducibility
+def main_train(args):
     torch.manual_seed(args.seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
     np.random.seed(args.seed)
+    random.seed(args.seed) # Seed python random for dataset split
     
-    # Print arguments
-    print("Training arguments:")
+    print("--- Training Configuration ---")
     for k, v in sorted(vars(args).items()):
         print(f"  {k}: {v}")
+    print("-----------------------------")
     
-    # Start training
-    train(args) 
+    train(args)
+
+# Argument parser setup (remains the same)
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='Train MobileSAM with LoRA on NuInsSeg dataset')
+    # Dataset parameters
+    parser.add_argument('--data_dir', type=str, default='NuInsSeg', help='Path to NuInsSeg dataset')
+    parser.add_argument('--image_size', type=int, default=1024, help='Input image size')
+    parser.add_argument('--num_workers', type=int, default=4, help='Number of data loading workers')
+    # Model parameters
+    parser.add_argument('--pretrained', type=str, default='weights/mobile_sam.pt', help='Path to pre-trained MobileSAM model')
+    parser.add_argument('--train_encoder', action=argparse.BooleanOptionalAction, default=True, help='Train the image encoder via LoRA') # Use BooleanOptionalAction
+    parser.add_argument('--train_decoder', action=argparse.BooleanOptionalAction, default=False, help='Train the mask decoder via LoRA') # Use BooleanOptionalAction
+    parser.add_argument('--train_only_lora', action=argparse.BooleanOptionalAction, default=True, help='Train only LoRA parameters and segmentation head') # Use BooleanOptionalAction
+    # LoRA parameters
+    parser.add_argument('--lora_rank', type=int, default=4, help='Rank of LoRA adaptation')
+    parser.add_argument('--lora_alpha', type=int, default=4, help='Alpha scaling factor for LoRA')
+    parser.add_argument('--lora_dropout', type=float, default=0.1, help='Dropout probability for LoRA layers')
+    # Training parameters
+    parser.add_argument('--batch_size', type=int, default=4, help='Training batch size')
+    parser.add_argument('--epochs', type=int, default=100, help='Number of training epochs')
+    parser.add_argument('--learning_rate', type=float, default=1e-4, help='Initial learning rate')
+    parser.add_argument('--min_lr', type=float, default=1e-6, help='Minimum learning rate for Cosine scheduler')
+    parser.add_argument('--weight_decay', type=float, default=1e-4, help='Weight decay')
+    parser.add_argument('--optimizer', type=str, default='adamw', choices=['adam', 'adamw', 'sgd'], help='Optimizer')
+    parser.add_argument('--lr_scheduler', type=str, default='cosine', choices=['cosine', 'step', 'reduce', 'none'], help='LR scheduler')
+    parser.add_argument('--lr_step_size', type=int, default=30, help='Step size for StepLR scheduler')
+    parser.add_argument('--lr_gamma', type=float, default=0.1, help='Gamma for StepLR/ReduceLROnPlateau scheduler')
+    parser.add_argument('--lr_patience', type=int, default=10, help='Patience for ReduceLROnPlateau scheduler (used with Val Dice)')
+    parser.add_argument('--grad_clip', type=float, default=1.0, help='Gradient clipping value (0 to disable)')
+    # Loss parameters
+    parser.add_argument('--dice_weight', type=float, default=0.5, help='Weight for Dice loss')
+    parser.add_argument('--focal_weight', type=float, default=0.5, help='Weight for Focal loss')
+    # Other parameters
+    parser.add_argument('--output_dir', type=str, default='output', help='Directory to save checkpoints and logs')
+    parser.add_argument('--save_interval', type=int, default=10, help='Epochs between checkpoint saves')
+    parser.add_argument('--early_stopping', action=argparse.BooleanOptionalAction, default=True, help='Enable early stopping based on Val Dice')
+    parser.add_argument('--patience', type=int, default=20, help='Patience for early stopping')
+    parser.add_argument('--seed', type=int, default=42, help='Random seed for reproducibility')
+    
+    args = parser.parse_args()
+    main_train(args) 

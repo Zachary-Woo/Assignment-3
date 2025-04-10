@@ -78,3 +78,143 @@
 # [7] Hu, Edward J., Yelong Shen, Phillip Wallis, Zeyuan Allen-Zhu, Yuanzhi Li, Shean Wang, Lu Wang, and
 # Weizhu Chen. "Lora: Low-rank adaptation of large language models." arXiv preprint arXiv:2106.09685 (2021).
 
+import argparse
+import sys
+import torch
+import numpy as np
+import random
+
+# Import functions from other modules
+from train import main_train
+from evaluate import main_evaluate
+from demo import main as main_demo # Renamed to avoid conflict
+from download_weights import main as main_download
+
+def set_seed(seed):
+    """Sets the seed for reproducibility."""
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+    # Potentially add torch.backends.cudnn settings if needed
+    # torch.backends.cudnn.deterministic = True
+    # torch.backends.cudnn.benchmark = False
+
+def parse_args():
+    parser = argparse.ArgumentParser(description='Main script for MobileSAM Nuclei Segmentation')
+    parser.add_argument('mode', choices=['train', 'evaluate', 'demo', 'download'], 
+                        help='Operation mode: train, evaluate, demo, or download weights')
+    parser.add_argument('--seed', type=int, default=42, help='Global random seed')
+    
+    # Add arguments common to multiple modes or allow unknown args
+    # Alternatively, parse known args first and pass remaining to sub-scripts
+
+    # Initial parse to get the mode
+    args, remaining_argv = parser.parse_known_args()
+    
+    # Add mode-specific arguments
+    if args.mode == 'train':
+        # Add training-specific arguments
+        train_parser = argparse.ArgumentParser(description='Training Arguments')
+        train_parser.add_argument('--data_dir', type=str, default='NuInsSeg')
+        train_parser.add_argument('--image_size', type=int, default=1024)
+        train_parser.add_argument('--num_workers', type=int, default=4)
+        train_parser.add_argument('--pretrained', type=str, default='weights/mobile_sam.pt')
+        train_parser.add_argument('--train_encoder', action=argparse.BooleanOptionalAction, default=True)
+        train_parser.add_argument('--train_decoder', action=argparse.BooleanOptionalAction, default=False)
+        train_parser.add_argument('--train_only_lora', action=argparse.BooleanOptionalAction, default=True)
+        train_parser.add_argument('--lora_rank', type=int, default=4)
+        train_parser.add_argument('--lora_alpha', type=int, default=4)
+        train_parser.add_argument('--lora_dropout', type=float, default=0.1)
+        train_parser.add_argument('--batch_size', type=int, default=4)
+        train_parser.add_argument('--epochs', type=int, default=100)
+        train_parser.add_argument('--learning_rate', type=float, default=1e-4)
+        train_parser.add_argument('--min_lr', type=float, default=1e-6)
+        train_parser.add_argument('--weight_decay', type=float, default=1e-4)
+        train_parser.add_argument('--optimizer', type=str, default='adamw', choices=['adam', 'adamw', 'sgd'])
+        train_parser.add_argument('--lr_scheduler', type=str, default='cosine', choices=['cosine', 'step', 'reduce', 'none'])
+        train_parser.add_argument('--lr_step_size', type=int, default=30)
+        train_parser.add_argument('--lr_gamma', type=float, default=0.1)
+        train_parser.add_argument('--lr_patience', type=int, default=10)
+        train_parser.add_argument('--grad_clip', type=float, default=1.0)
+        train_parser.add_argument('--dice_weight', type=float, default=0.5)
+        train_parser.add_argument('--focal_weight', type=float, default=0.5)
+        train_parser.add_argument('--output_dir', type=str, default='output')
+        train_parser.add_argument('--save_interval', type=int, default=10)
+        train_parser.add_argument('--early_stopping', action=argparse.BooleanOptionalAction, default=True)
+        train_parser.add_argument('--patience', type=int, default=20)
+        # Add seed again for consistency, it will be overwritten by the main parser's seed
+        train_parser.add_argument('--seed', type=int, default=42)
+        # Parse the *remaining* arguments using the train parser
+        mode_args = train_parser.parse_args(remaining_argv)
+        
+    elif args.mode == 'evaluate':
+        eval_parser = argparse.ArgumentParser(description='Evaluation Arguments')
+        eval_parser.add_argument('--data_dir', type=str, default='NuInsSeg')
+        eval_parser.add_argument('--image_size', type=int, default=1024)
+        eval_parser.add_argument('--num_workers', type=int, default=4)
+        eval_parser.add_argument('--model_path', type=str, required=True)
+        eval_parser.add_argument('--batch_size', type=int, default=4)
+        eval_parser.add_argument('--threshold', type=float, default=0.5)
+        eval_parser.add_argument('--output_dir', type=str, default='evaluation_results')
+        eval_parser.add_argument('--visualize', action=argparse.BooleanOptionalAction, default=True)
+        eval_parser.add_argument('--num_visualizations', type=int, default=20)
+        eval_parser.add_argument('--plot', action=argparse.BooleanOptionalAction, default=True)
+        eval_parser.add_argument('--seed', type=int, default=42)
+        mode_args = eval_parser.parse_args(remaining_argv)
+        
+    elif args.mode == 'demo':
+        demo_parser = argparse.ArgumentParser(description='Demo Arguments')
+        demo_parser.add_argument('--model_path', type=str, required=True)
+        demo_parser.add_argument('--data_dir', type=str, default='NuInsSeg')
+        demo_parser.add_argument('--image_size', type=int, default=1024)
+        demo_parser.add_argument('--num_samples', type=int, default=5)
+        demo_parser.add_argument('--threshold', type=float, default=0.5)
+        demo_parser.add_argument('--output_dir', type=str, default='demo_outputs')
+        demo_parser.add_argument('--cpu', action='store_true')
+        mode_args = demo_parser.parse_args(remaining_argv)
+
+    elif args.mode == 'download':
+        dl_parser = argparse.ArgumentParser(description='Download Arguments')
+        dl_parser.add_argument('--model', type=str, default="mobile_sam", choices=["mobile_sam", "all"])
+        dl_parser.add_argument('--output_dir', type=str, default="weights")
+        dl_parser.add_argument('--force', action="store_true")
+        mode_args = dl_parser.parse_args(remaining_argv)
+        
+    else:
+        # Should not happen due to choices constraint
+        parser.print_help()
+        sys.exit(1)
+        
+    # Combine the main args (mode, seed) with the mode-specific args
+    # Overwrite mode_args.seed with the global seed
+    final_args = mode_args
+    final_args.mode = args.mode 
+    final_args.seed = args.seed 
+    
+    return final_args
+
+if __name__ == "__main__":
+    args = parse_args()
+    
+    # Set the global random seed
+    print(f"Setting global random seed to: {args.seed}")
+    set_seed(args.seed)
+    
+    # Execute the selected mode
+    if args.mode == 'train':
+        print("\n--- Running Training ---")
+        main_train(args)
+    elif args.mode == 'evaluate':
+        print("\n--- Running Evaluation ---")
+        main_evaluate(args)
+    elif args.mode == 'demo':
+        print("\n--- Running Demo ---")
+        main_demo(args)
+    elif args.mode == 'download':
+        print("\n--- Running Download ---")
+        main_download(args)
+        
+    print(f"\n--- {args.mode.capitalize()} finished ---")
+
