@@ -1,14 +1,11 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Dict, List, Optional, Tuple
 
 # Import math for initializing weights
 import math
 
 # Assume official mobile_sam package is installed
-from mobile_sam.modeling.tiny_vit_sam import TinyViT # Assuming TinyViT structure
-from mobile_sam.modeling.mask_decoder import MaskDecoder # Assuming MaskDecoder structure
 from mobile_sam.modeling.sam import Sam # Import base Sam model
 
 class LoRALinear(nn.Module):

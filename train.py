@@ -3,17 +3,16 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 import argparse
 import numpy as np
+import random
 from tqdm import tqdm
 import json
 import time
-from datetime import datetime
 from pathlib import Path
 
-from dataset import create_dataloaders
+from dataset import create_dataloaders, create_cross_val_indices
 # Use the official MobileSAM registry
 from mobile_sam import sam_model_registry
 # Import the adapted LoRA wrapper
@@ -227,8 +226,15 @@ def validate_one_epoch(model, val_loader, criterion, device):
     avg_metrics = {k: v / num_batches for k, v in epoch_metrics.items()}
     return avg_loss, avg_metrics
 
-def train(args):
-    save_dir = Path(args.output_dir)
+def train_fold(args, fold_idx=None, num_folds=None, cross_val_indices=None):
+    """Train model on a specific fold (or standard split if fold_idx is None)"""
+    # Setup directories
+    if fold_idx is not None:
+        fold_dir = os.path.join(args.output_dir, f"fold_{fold_idx+1}")
+        save_dir = Path(fold_dir)
+    else:
+        save_dir = Path(args.output_dir)
+    
     save_dir.mkdir(parents=True, exist_ok=True)
     log_dir = save_dir / 'logs'
     log_dir.mkdir(exist_ok=True)
@@ -247,7 +253,10 @@ def train(args):
         batch_size=args.batch_size,
         image_size=args.image_size,
         num_workers=args.num_workers,
-        seed=args.seed # Pass seed to dataloader creation
+        seed=args.seed,
+        fold_idx=fold_idx,
+        num_folds=num_folds,
+        cross_val_indices=cross_val_indices[fold_idx] if cross_val_indices else None
     )
     
     # Load base official model
@@ -258,7 +267,7 @@ def train(args):
 
     # Apply LoRA using the adapted wrapper
     # Ensure use_temp_head is True if not fine-tuning original decoder
-    use_temp_head = not args.train_decoder 
+    use_temp_head = not args.train_decoder
     lora_model = MobileSAM_LoRA_Adapted(
         model=base_model,
         r=args.lora_rank,
@@ -276,13 +285,9 @@ def train(args):
         print("Configuring optimizer for LoRA parameters and segmentation head...")
         trainable_params = lora_model.get_trainable_parameters() # Gets LoRA + Head params
     else:
-        print("Configuring optimizer for all trainable parameters (likely full model fine-tuning)...")
-        # This would typically involve unfreezing parts of the base_model *before* wrapping
-        # For simplicity, this mode currently trains the same as train_only_lora
-        # If full finetuning is desired, the MobileSAM_LoRA_Adapted needs modification
-        # or training should use `base_model` directly without the LoRA wrapper.
+        print("Configuring optimizer for all trainable parameters...")
         trainable_params = filter(lambda p: p.requires_grad, lora_model.parameters())
-        # Print count again to confirm
+        # Print count
         lora_model.get_trainable_parameters()
 
     # Optimizer
@@ -307,7 +312,11 @@ def train(args):
     best_epoch = 0
     num_epochs_no_improvement = 0
     
-    print(f"Starting training for {args.epochs} epochs...")
+    if fold_idx is not None:
+        print(f"\nStarting training for Fold {fold_idx+1}/{num_folds}, {args.epochs} epochs...")
+    else:
+        print(f"\nStarting training for {args.epochs} epochs...")
+    
     start_time = time.time()
     
     for epoch in range(args.epochs):
@@ -321,7 +330,7 @@ def train(args):
         # Scheduler step logic
         if scheduler:
             if args.lr_scheduler == 'reduce':
-                scheduler.step(val_metrics['Dice']) # ReduceLROnPlateau often tracks validation metric
+                scheduler.step(val_metrics['Dice'])
             else:
                 scheduler.step()
         
@@ -335,7 +344,8 @@ def train(args):
         writer.add_scalar('LR', optimizer.param_groups[0]['lr'], epoch)
         writer.add_scalar('Time/epoch', epoch_duration, epoch)
         
-        print(f"Epoch {epoch+1}/{args.epochs} [{epoch_duration:.2f}s] - Train Loss: {train_loss:.4f}, Train Dice: {train_metrics['Dice']:.4f}, Val Loss: {val_loss:.4f}, Val Dice: {val_metrics['Dice']:.4f}, LR: {optimizer.param_groups[0]['lr']:.6f}")
+        fold_str = f"Fold {fold_idx+1}/{num_folds} " if fold_idx is not None else ""
+        print(f"{fold_str}Epoch {epoch+1}/{args.epochs} [{epoch_duration:.2f}s] - Train Loss: {train_loss:.4f}, Train Dice: {train_metrics['Dice']:.4f}, Val Loss: {val_loss:.4f}, Val Dice: {val_metrics['Dice']:.4f}, LR: {optimizer.param_groups[0]['lr']:.6f}")
         
         # Checkpointing and Early Stopping
         if val_metrics['Dice'] > best_val_dice:
@@ -343,6 +353,7 @@ def train(args):
             best_val_loss = val_loss
             best_epoch = epoch
             num_epochs_no_improvement = 0
+            
             # Save the best model state dictionary
             torch.save({
                 'epoch': epoch,
@@ -351,8 +362,10 @@ def train(args):
                 'val_loss': val_loss,
                 'val_dice': val_metrics['Dice'],
                 'val_iou': val_metrics['IoU'],
-                'args': vars(args)
+                'args': vars(args),
+                'fold': fold_idx
             }, save_dir / 'best_model.pth')
+            
             print(f"---> Saved best model (Epoch {epoch+1}) with Val Dice: {best_val_dice:.4f}")
         else:
             num_epochs_no_improvement += 1
@@ -367,7 +380,8 @@ def train(args):
                 'val_loss': val_loss,
                 'val_dice': val_metrics['Dice'],
                 'val_iou': val_metrics['IoU'],
-                'args': vars(args)
+                'args': vars(args),
+                'fold': fold_idx
             }, save_dir / f'checkpoint_epoch_{epoch+1}.pth')
             print(f"---> Saved checkpoint at epoch {epoch+1}")
         
@@ -382,6 +396,8 @@ def train(args):
     # Final test evaluation using the best saved model
     print("\nLoading best model for final test evaluation...")
     best_model_path = save_dir / 'best_model.pth'
+    test_metrics = {}
+    
     if best_model_path.exists():
         checkpoint = torch.load(best_model_path, map_location=device)
         # Recreate model structure based on saved args
@@ -401,7 +417,8 @@ def train(args):
         
         test_loss, test_metrics = validate_one_epoch(lora_model_test, test_loader, criterion, device)
         
-        print(f"\nFinal Test Results (using best model from epoch {checkpoint['epoch']+1}):")
+        fold_str = f"Fold {fold_idx+1}/{num_folds} " if fold_idx is not None else ""
+        print(f"\nFinal Test Results ({fold_str}using best model from epoch {checkpoint['epoch']+1}):")
         print(f"  Test Loss: {test_loss:.4f}")
         print(f"  Test IoU:  {test_metrics['IoU']:.4f}")
         print(f"  Test Dice: {test_metrics['Dice']:.4f}")
@@ -413,6 +430,7 @@ def train(args):
             'best_epoch': best_epoch + 1, # 1-based index
             'best_val_loss': best_val_loss,
             'best_val_dice': best_val_dice,
+            'fold': fold_idx,
             'total_training_time_seconds': total_training_time
         }
     else:
@@ -423,16 +441,62 @@ def train(args):
         json.dump(results_data, f, indent=4)
     
     writer.close()
-    print(f"\nTraining completed. Best model saved at epoch {best_epoch+1} with Val Dice: {best_val_dice:.4f}")
+    
+    fold_str = f"Fold {fold_idx+1}/{num_folds} " if fold_idx is not None else ""
+    print(f"\nTraining completed for {fold_str}. Best model saved at epoch {best_epoch+1} with Val Dice: {best_val_dice:.4f}")
     print(f"Results and logs saved in: {save_dir}")
-    return best_val_dice, results_data.get('test_dice', 0.0)
+    
+    return best_val_dice, test_metrics.get('Dice', 0.0)
+
+def train(args):
+    """Main training function - handles k-fold or standard training"""
+    if args.cross_validation:
+        print(f"Running {args.num_folds}-fold cross-validation...")
+        # Create cross-validation indices to ensure consistent folds
+        cross_val_indices = create_cross_val_indices(args.data_dir, args.num_folds, args.seed)
+        
+        # Track fold metrics
+        fold_metrics = {}
+        
+        for fold_idx in range(args.num_folds):
+            val_dice, test_dice = train_fold(args, fold_idx, args.num_folds, cross_val_indices)
+            fold_metrics[fold_idx] = {
+                'val_dice': val_dice,
+                'test_dice': test_dice
+            }
+        
+        # Calculate average metrics
+        avg_val_dice = np.mean([metrics['val_dice'] for metrics in fold_metrics.values()])
+        avg_test_dice = np.mean([metrics['test_dice'] for metrics in fold_metrics.values()])
+        
+        # Save cross-validation summary
+        summary = {
+            'fold_metrics': fold_metrics,
+            'avg_val_dice': avg_val_dice,
+            'avg_test_dice': avg_test_dice,
+            'args': vars(args)
+        }
+        
+        with open(os.path.join(args.output_dir, 'cross_validation_results.json'), 'w') as f:
+            json.dump(summary, f, indent=4)
+        
+        print("\nCross-Validation Results Summary:")
+        for fold_idx, metrics in fold_metrics.items():
+            print(f"  Fold {fold_idx+1}/{args.num_folds}: Val Dice = {metrics['val_dice']:.4f}, Test Dice = {metrics['test_dice']:.4f}")
+        print(f"  Average: Val Dice = {avg_val_dice:.4f}, Test Dice = {avg_test_dice:.4f}")
+        
+        return avg_val_dice, avg_test_dice
+    else:
+        # Standard training
+        return train_fold(args)
 
 def main_train(args):
+    """Main training entry point"""
     torch.manual_seed(args.seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
     np.random.seed(args.seed)
-    random.seed(args.seed) # Seed python random for dataset split
+    random.seed(args.seed)
     
     print("--- Training Configuration ---")
     for k, v in sorted(vars(args).items()):
@@ -441,7 +505,7 @@ def main_train(args):
     
     train(args)
 
-# Argument parser setup (remains the same)
+# Updated arg parser with new parameters
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Train MobileSAM with LoRA on NuInsSeg dataset')
     # Dataset parameters
@@ -450,13 +514,16 @@ if __name__ == '__main__':
     parser.add_argument('--num_workers', type=int, default=4, help='Number of data loading workers')
     # Model parameters
     parser.add_argument('--pretrained', type=str, default='weights/mobile_sam.pt', help='Path to pre-trained MobileSAM model')
-    parser.add_argument('--train_encoder', action=argparse.BooleanOptionalAction, default=True, help='Train the image encoder via LoRA') # Use BooleanOptionalAction
-    parser.add_argument('--train_decoder', action=argparse.BooleanOptionalAction, default=False, help='Train the mask decoder via LoRA') # Use BooleanOptionalAction
-    parser.add_argument('--train_only_lora', action=argparse.BooleanOptionalAction, default=True, help='Train only LoRA parameters and segmentation head') # Use BooleanOptionalAction
+    parser.add_argument('--train_encoder', action=argparse.BooleanOptionalAction, default=True, help='Train the image encoder via LoRA')
+    parser.add_argument('--train_decoder', action=argparse.BooleanOptionalAction, default=False, help='Train the mask decoder via LoRA')
+    parser.add_argument('--train_only_lora', action=argparse.BooleanOptionalAction, default=True, help='Train only LoRA parameters and segmentation head')
     # LoRA parameters
     parser.add_argument('--lora_rank', type=int, default=4, help='Rank of LoRA adaptation')
     parser.add_argument('--lora_alpha', type=int, default=4, help='Alpha scaling factor for LoRA')
     parser.add_argument('--lora_dropout', type=float, default=0.1, help='Dropout probability for LoRA layers')
+    # Cross-validation parameters
+    parser.add_argument('--cross_validation', action=argparse.BooleanOptionalAction, default=True, help='Use cross-validation')
+    parser.add_argument('--num_folds', type=int, default=5, help='Number of folds for cross-validation')
     # Training parameters
     parser.add_argument('--batch_size', type=int, default=4, help='Training batch size')
     parser.add_argument('--epochs', type=int, default=100, help='Number of training epochs')

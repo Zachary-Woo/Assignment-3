@@ -1,3 +1,21 @@
 /NuInsSeg/
 /Assignment-3.pdf
+/weights/
+/__pycache__/
+
+/output_lora/logs/
+/output_lora/best_model.pth
+/output_lora/checkpoint_*
+
+/parameter_search/rank2*
+/parameter_search/rank4*
+/parameter_search/rank8*
+/parameter_search/rank16*
+
+/output_lora_optimal/fold_*
+
+/evaluation_lora_optimal/fold_1/visualizations
+/evaluation_lora_optimal/fold_2/visualizations
+/evaluation_lora_optimal/fold_3/visualizations
+/evaluation_lora_optimal/fold_4/visualizations
 

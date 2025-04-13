@@ -2,7 +2,6 @@ import os
 import requests
 import argparse
 from tqdm import tqdm
-from pathlib import Path
 
 def download_file(url, dest_path):
     """

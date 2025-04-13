@@ -11,13 +11,177 @@ import matplotlib.pyplot as plt
 from skimage import io
 import cv2
 import random # Import random for seed setting
+from skimage import measure # For connected components
+from scipy.optimize import linear_sum_assignment # For solving assignment problem in PQ
 
 from dataset import create_dataloaders
 from mobile_sam import sam_model_registry
 from lora import MobileSAM_LoRA_Adapted
 from train import calculate_metrics
 
-def evaluate(args):
+# Add instance segmentation metrics
+def calculate_aji(pred_mask, true_mask):
+    """
+    Calculate Aggregated Jaccard Index (AJI) for instance segmentation.
+    
+    Args:
+        pred_mask: Binary prediction mask (H, W)
+        true_mask: Ground truth instance mask (H, W) with unique IDs for each instance
+    
+    Returns:
+        AJI score (float)
+    """
+    # Create instance segmentation from binary pred_mask using connected components
+    if np.max(pred_mask) <= 1:  # If it's a binary mask
+        labeled_pred = measure.label(pred_mask)
+    else:
+        labeled_pred = pred_mask.copy()
+        
+    # Ground truth instances
+    if np.max(true_mask) <= 1:  # If it's a binary mask (shouldn't be the case)
+        print("Warning: Ground truth mask appears to be binary, not instance segmentation")
+        labeled_true = measure.label(true_mask)
+    else:
+        labeled_true = true_mask.copy()
+    
+    # Get unique instances (exclude background 0)
+    true_ids = np.unique(labeled_true)[1:]  # Skip background
+    pred_ids = np.unique(labeled_pred)[1:]  # Skip background
+    
+    if len(true_ids) == 0 or len(pred_ids) == 0:
+        if len(true_ids) == len(pred_ids):  # Both empty
+            return 1.0
+        else:  # One is empty, the other is not
+            return 0.0
+    
+    # Compute IoU between each pair of predicted and true instances
+    iou_matrix = np.zeros((len(true_ids), len(pred_ids)))
+    
+    for i, true_id in enumerate(true_ids):
+        true_mask_i = (labeled_true == true_id)
+        for j, pred_id in enumerate(pred_ids):
+            pred_mask_j = (labeled_pred == pred_id)
+            
+            # Calculate IoU
+            intersection = np.sum(np.logical_and(true_mask_i, pred_mask_j))
+            union = np.sum(np.logical_or(true_mask_i, pred_mask_j))
+            
+            iou_matrix[i, j] = intersection / union if union > 0 else 0.0
+    
+    # Find the best matching using the Hungarian algorithm
+    true_indices, pred_indices = linear_sum_assignment(-iou_matrix)
+    
+    # Calculate AJI
+    numerator = 0
+    denominator = 0
+    
+    used_pred = set()
+    for i, j in zip(true_indices, pred_indices):
+        if iou_matrix[i, j] > 0:
+            true_id = true_ids[i]
+            pred_id = pred_ids[j]
+            
+            true_mask_i = (labeled_true == true_id)
+            pred_mask_j = (labeled_pred == pred_id)
+            
+            intersection = np.sum(np.logical_and(true_mask_i, pred_mask_j))
+            union = np.sum(np.logical_or(true_mask_i, pred_mask_j))
+            
+            numerator += intersection
+            denominator += union
+            
+            used_pred.add(pred_id)
+    
+    # Add the remaining predictions to the denominator
+    for pred_id in pred_ids:
+        if pred_id not in used_pred:
+            pred_mask_j = (labeled_pred == pred_id)
+            denominator += np.sum(pred_mask_j)
+    
+    aji = numerator / denominator if denominator > 0 else 0.0
+    return aji
+
+def calculate_pq(pred_mask, true_mask, iou_threshold=0.5):
+    """
+    Calculate Panoptic Quality (PQ) for instance segmentation.
+    
+    Args:
+        pred_mask: Binary prediction mask (H, W)
+        true_mask: Ground truth instance mask (H, W) with unique IDs for each instance
+        iou_threshold: IoU threshold for true positive determination
+    
+    Returns:
+        PQ score (float), with components SQ (Segmentation Quality) and RQ (Recognition Quality)
+    """
+    # Create instance segmentation from binary pred_mask using connected components
+    if np.max(pred_mask) <= 1:  # If it's a binary mask
+        labeled_pred = measure.label(pred_mask)
+    else:
+        labeled_pred = pred_mask.copy()
+    
+    # Ground truth instances
+    if np.max(true_mask) <= 1:  # If it's a binary mask (shouldn't be the case)
+        labeled_true = measure.label(true_mask)
+    else:
+        labeled_true = true_mask.copy()
+    
+    # Get unique instances (exclude background 0)
+    true_ids = np.unique(labeled_true)[1:]  # Skip background
+    pred_ids = np.unique(labeled_pred)[1:]  # Skip background
+    
+    if len(true_ids) == 0 and len(pred_ids) == 0:  # Both empty
+        return {'PQ': 1.0, 'SQ': 1.0, 'RQ': 1.0}
+    
+    if len(true_ids) == 0 or len(pred_ids) == 0:  # One is empty, the other is not
+        return {'PQ': 0.0, 'SQ': 0.0, 'RQ': 0.0}
+    
+    # Compute IoU between each pair of predicted and true instances
+    iou_matrix = np.zeros((len(true_ids), len(pred_ids)))
+    
+    for i, true_id in enumerate(true_ids):
+        true_mask_i = (labeled_true == true_id)
+        for j, pred_id in enumerate(pred_ids):
+            pred_mask_j = (labeled_pred == pred_id)
+            
+            # Calculate IoU
+            intersection = np.sum(np.logical_and(true_mask_i, pred_mask_j))
+            union = np.sum(np.logical_or(true_mask_i, pred_mask_j))
+            
+            iou_matrix[i, j] = intersection / union if union > 0 else 0.0
+    
+    # Find matches above threshold
+    true_matches = -np.ones(len(true_ids), dtype=int)
+    pred_matches = -np.ones(len(pred_ids), dtype=int)
+    
+    # Greedy matching based on IoU
+    for i in range(len(true_ids)):
+        for j in range(len(pred_ids)):
+            if iou_matrix[i, j] >= iou_threshold:
+                if true_matches[i] == -1 and pred_matches[j] == -1:
+                    true_matches[i] = j
+                    pred_matches[j] = i
+    
+    # Count statistics
+    tp = np.sum(true_matches >= 0)
+    fp = len(pred_ids) - tp
+    fn = len(true_ids) - tp
+    
+    # Calculate PQ metrics
+    if tp == 0:
+        return {'PQ': 0.0, 'SQ': 0.0, 'RQ': 0.0}
+    
+    # Segmentation quality: average IoU of matched segments
+    sq = np.mean([iou_matrix[i, true_matches[i]] for i in range(len(true_ids)) if true_matches[i] >= 0])
+    
+    # Recognition quality: F1 score
+    rq = tp / (tp + 0.5 * fp + 0.5 * fn) if (tp + 0.5 * fp + 0.5 * fn) > 0 else 0.0
+    
+    # Panoptic quality
+    pq = sq * rq
+    
+    return {'PQ': pq, 'SQ': sq, 'RQ': rq}
+
+def main_evaluate(args):
     """
     Evaluation function
     """
@@ -97,8 +261,14 @@ def evaluate(args):
     metrics = {
         'iou': [],
         'dice': [],
+        'aji': [],      # Added AJI metric
+        'pq': [],       # Added PQ metric
+        'sq': [],       # Added SQ component of PQ
+        'rq': [],       # Added RQ component of PQ
         'tissue_iou': {},  # Store metrics by tissue type
-        'tissue_dice': {}
+        'tissue_dice': {},
+        'tissue_aji': {},  # Added tissue-specific AJI
+        'tissue_pq': {}    # Added tissue-specific PQ
     }
     
     # Process each batch
@@ -129,6 +299,8 @@ def evaluate(args):
                 if tissue_type not in metrics['tissue_iou']:
                     metrics['tissue_iou'][tissue_type] = []
                     metrics['tissue_dice'][tissue_type] = []
+                    metrics['tissue_aji'][tissue_type] = []
+                    metrics['tissue_pq'][tissue_type] = []
                 
                 pred_mask_single = outputs[i:i+1]
                 true_mask_single = masks[i:i+1]
@@ -136,6 +308,23 @@ def evaluate(args):
                 
                 metrics['tissue_iou'][tissue_type].append(sample_metrics['IoU'])
                 metrics['tissue_dice'][tissue_type].append(sample_metrics['Dice'])
+                
+                # Calculate instance metrics for this sample
+                # Convert tensors to numpy for instance metrics
+                binary_pred = (torch.sigmoid(outputs[i, 0]) > args.threshold).cpu().numpy().astype(np.uint8)
+                true_mask_np = true_mask_single[0].cpu().numpy()
+                
+                # Calculate AJI
+                aji_score = calculate_aji(binary_pred, true_mask_np)
+                metrics['aji'].append(aji_score)
+                metrics['tissue_aji'][tissue_type].append(aji_score)
+                
+                # Calculate PQ
+                pq_results = calculate_pq(binary_pred, true_mask_np, iou_threshold=0.5)
+                metrics['pq'].append(pq_results['PQ'])
+                metrics['sq'].append(pq_results['SQ'])
+                metrics['rq'].append(pq_results['RQ'])
+                metrics['tissue_pq'][tissue_type].append(pq_results['PQ'])
                 
                 # Visualize if needed
                 if args.visualize and (batch_idx * args.batch_size + i) < args.num_visualizations:
@@ -149,6 +338,8 @@ def evaluate(args):
                         pred_mask=torch.sigmoid(outputs[i, 0]).cpu().numpy(), # Pass probabilities
                         iou=sample_metrics['IoU'],
                         dice=sample_metrics['Dice'],
+                        aji=aji_score,
+                        pq=pq_results['PQ'],
                         save_path=os.path.join(vis_dir, f"sample_{Path(img_path).stem}.png"),
                         tissue_type=tissue_type,
                         threshold=args.threshold # Pass threshold to viz
@@ -163,6 +354,10 @@ def evaluate(args):
     # Calculate average metrics
     mean_iou = np.mean(metrics['iou']) if metrics['iou'] else 0.0
     mean_dice = np.mean(metrics['dice']) if metrics['dice'] else 0.0
+    mean_aji = np.mean(metrics['aji']) if metrics['aji'] else 0.0
+    mean_pq = np.mean(metrics['pq']) if metrics['pq'] else 0.0
+    mean_sq = np.mean(metrics['sq']) if metrics['sq'] else 0.0
+    mean_rq = np.mean(metrics['rq']) if metrics['rq'] else 0.0
     
     # Calculate per-tissue metrics
     tissue_metrics_agg = {}
@@ -170,21 +365,31 @@ def evaluate(args):
     for tissue_type in sorted(metrics['tissue_iou'].keys()):
         tissue_iou_list = metrics['tissue_iou'][tissue_type]
         tissue_dice_list = metrics['tissue_dice'][tissue_type]
+        tissue_aji_list = metrics['tissue_aji'][tissue_type]
+        tissue_pq_list = metrics['tissue_pq'][tissue_type]
         num_samples = len(tissue_iou_list)
         avg_tissue_iou = np.mean(tissue_iou_list) if num_samples > 0 else 0.0
         avg_tissue_dice = np.mean(tissue_dice_list) if num_samples > 0 else 0.0
+        avg_tissue_aji = np.mean(tissue_aji_list) if num_samples > 0 else 0.0
+        avg_tissue_pq = np.mean(tissue_pq_list) if num_samples > 0 else 0.0
         tissue_metrics_agg[tissue_type] = {
             'iou': avg_tissue_iou,
             'dice': avg_tissue_dice,
+            'aji': avg_tissue_aji,
+            'pq': avg_tissue_pq,
             'num_samples': num_samples
         }
-        print(f"  {tissue_type} ({num_samples} samples): IoU: {avg_tissue_iou:.4f}, Dice: {avg_tissue_dice:.4f}")
+        print(f"  {tissue_type} ({num_samples} samples): IoU: {avg_tissue_iou:.4f}, Dice: {avg_tissue_dice:.4f}, AJI: {avg_tissue_aji:.4f}, PQ: {avg_tissue_pq:.4f}")
     
     # Save results
     results = {
         'overall': {
             'iou': mean_iou,
-            'dice': mean_dice
+            'dice': mean_dice,
+            'aji': mean_aji,
+            'pq': mean_pq,
+            'sq': mean_sq,
+            'rq': mean_rq
         },
         'tissue_metrics': tissue_metrics_agg,
         'evaluation_args': vars(args) # Save eval args too
@@ -197,24 +402,43 @@ def evaluate(args):
     if args.plot and tissue_metrics_agg:
         plot_metrics_by_tissue(tissue_metrics_agg, os.path.join(args.output_dir, 'metrics_by_tissue.png'))
     
+    print(f"\nOverall Results:")
+    print(f"  IoU:  {mean_iou:.4f}")
+    print(f"  Dice: {mean_dice:.4f}")
+    print(f"  AJI:  {mean_aji:.4f}")
+    print(f"  PQ:   {mean_pq:.4f}")
+    print(f"  SQ:   {mean_sq:.4f}")
+    print(f"  RQ:   {mean_rq:.4f}")
+    
     return mean_dice
 
 
-def visualize_prediction(image, true_mask, pred_mask, iou, dice, save_path, tissue_type, threshold=0.5):
+def visualize_prediction(image, true_mask, pred_mask, iou, dice, aji, pq, save_path, tissue_type, threshold=0.5):
     """
     Create visualization of prediction vs ground truth
     
     Args:
-        image: Input image (C, H, W)
+        image: Input image (H, W, C)
         true_mask: Ground truth mask (H, W)
         pred_mask: Predicted mask (H, W)
         iou: IoU score
         dice: Dice score
+        aji: AJI score
+        pq: PQ score
         save_path: Path to save visualization
         tissue_type: Type of tissue
         threshold: Threshold for converting prediction probabilities to binary masks
     """
+    # Make sure image and masks have same dimensions
     h, w = image.shape[:2]
+    
+    # Resize masks to match image dimensions if needed
+    if true_mask.shape[0] != h or true_mask.shape[1] != w:
+        true_mask = cv2.resize(true_mask, (w, h), interpolation=cv2.INTER_NEAREST)
+    
+    if pred_mask.shape[0] != h or pred_mask.shape[1] != w:
+        pred_mask = cv2.resize(pred_mask, (w, h), interpolation=cv2.INTER_NEAREST)
+    
     # Prediction mask already passed as probabilities, apply threshold here
     pred_mask_binary = (pred_mask > threshold).astype(np.uint8)
     true_mask_binary = (true_mask > 0).astype(np.uint8)
@@ -230,23 +454,40 @@ def visualize_prediction(image, true_mask, pred_mask, iou, dice, save_path, tiss
     pred_overlay = image.copy()
     comparison = image.copy()
     
-    true_idx = true_mask_binary > 0
-    pred_idx = pred_mask_binary > 0
-    overlap_idx = true_idx & pred_idx
-    fp_idx = pred_idx & ~true_idx # False positive (Red)
-    fn_idx = true_idx & ~pred_idx # False negative (Blue)
+    # Create boolean masks for overlays
+    true_idx = np.where(true_mask_binary > 0)
+    pred_idx = np.where(pred_mask_binary > 0)
     
-    # Green overlay for GT
-    overlay[true_idx] = (alpha * green + (1 - alpha) * image[true_idx]).astype(np.uint8)
-    # Red overlay for Pred
-    pred_overlay[pred_idx] = (alpha * red + (1 - alpha) * image[pred_idx]).astype(np.uint8)
+    # Create masks for comparison
+    true_mask_2d = true_mask_binary > 0
+    pred_mask_2d = pred_mask_binary > 0
+    overlap_mask = true_mask_2d & pred_mask_2d
+    fp_mask = pred_mask_2d & ~true_mask_2d  # False positive
+    fn_mask = true_mask_2d & ~pred_mask_2d  # False negative
+    
+    # Apply overlays - safe indexing
+    for i, j in zip(*true_idx):
+        overlay[i, j] = (alpha * green + (1 - alpha) * image[i, j]).astype(np.uint8)
+    
+    for i, j in zip(*pred_idx):
+        pred_overlay[i, j] = (alpha * red + (1 - alpha) * image[i, j]).astype(np.uint8)
+    
     # Comparison overlay
-    comparison[fn_idx] = (alpha * blue + (1 - alpha) * image[fn_idx]).astype(np.uint8)
-    comparison[fp_idx] = (alpha * red + (1 - alpha) * image[fp_idx]).astype(np.uint8)
-    comparison[overlap_idx] = (alpha * green + (1 - alpha) * image[overlap_idx]).astype(np.uint8)
+    fn_idx = np.where(fn_mask)
+    fp_idx = np.where(fp_mask)
+    overlap_idx = np.where(overlap_mask)
+    
+    for i, j in zip(*fn_idx):
+        comparison[i, j] = (alpha * blue + (1 - alpha) * image[i, j]).astype(np.uint8)
+    
+    for i, j in zip(*fp_idx):
+        comparison[i, j] = (alpha * red + (1 - alpha) * image[i, j]).astype(np.uint8)
+    
+    for i, j in zip(*overlap_idx):
+        comparison[i, j] = (alpha * green + (1 - alpha) * image[i, j]).astype(np.uint8)
     
     fig, axes = plt.subplots(2, 2, figsize=(12, 10))
-    fig.suptitle(f"Tissue: {tissue_type.replace('_', ' ')} | IoU: {iou:.4f} | Dice: {dice:.4f}", fontsize=14)
+    fig.suptitle(f"Tissue: {tissue_type.replace('_', ' ')}\nIoU: {iou:.4f}, Dice: {dice:.4f}, AJI: {aji:.4f}, PQ: {pq:.4f}", fontsize=14)
     
     axes[0, 0].imshow(image)
     axes[0, 0].set_title("Original Image")
@@ -285,28 +526,73 @@ def plot_metrics_by_tissue(tissue_metrics, save_path):
     tissue_names = [t[0] for t in sorted_tissues]
     dice_scores = [t[1]['dice'] for t in sorted_tissues]
     iou_scores = [t[1]['iou'] for t in sorted_tissues]
+    aji_scores = [t[1]['aji'] for t in sorted_tissues]
+    pq_scores = [t[1]['pq'] for t in sorted_tissues]
     sample_counts = [t[1]['num_samples'] for t in sorted_tissues]
     
-    plt.figure(figsize=(max(10, len(tissue_names) * 0.5), 6))
-    bar_width = 0.35
+    # Create a figure with subplots for different metrics
+    fig, axes = plt.subplots(2, 1, figsize=(max(12, len(tissue_names) * 0.5), 12))
+    
+    # Plot Dice and IoU in the first subplot
+    bar_width = 0.25
     index = np.arange(len(tissue_names))
     
-    plt.bar(index, dice_scores, bar_width, label='Dice', color='skyblue')
-    plt.bar(index + bar_width, iou_scores, bar_width, label='IoU', color='lightcoral')
+    axes[0].bar(index - bar_width/2, dice_scores, bar_width, label='Dice', color='skyblue')
+    axes[0].bar(index + bar_width/2, iou_scores, bar_width, label='IoU', color='lightcoral')
     
     for i, count in enumerate(sample_counts):
-        plt.text(i + bar_width / 2, max(dice_scores[i], iou_scores[i]) + 0.01, f"n={count}", ha='center', va='bottom', fontsize=8)
+        axes[0].text(i, max(dice_scores[i], iou_scores[i]) + 0.01, f"n={count}", ha='center', va='bottom', fontsize=8)
     
-    plt.xlabel('Tissue Type', fontsize=12)
-    plt.ylabel('Score', fontsize=12)
-    plt.title('Model Performance by Tissue Type', fontsize=14)
-    plt.xticks(index + bar_width / 2, [name.replace('_', ' \n') for name in tissue_names], rotation=90, ha='center', fontsize=9)
-    plt.yticks(np.arange(0, 1.1, 0.1))
-    plt.ylim(0, 1.05)
-    plt.legend(loc='lower right')
-    plt.grid(axis='y', linestyle='--', alpha=0.7)
+    axes[0].set_xlabel('Tissue Type', fontsize=12)
+    axes[0].set_ylabel('Score', fontsize=12)
+    axes[0].set_title('Dice and IoU by Tissue Type', fontsize=14)
+    axes[0].set_xticks(index)
+    axes[0].set_xticklabels([name.replace('_', ' \n') for name in tissue_names], rotation=90, ha='center', fontsize=9)
+    axes[0].set_yticks(np.arange(0, 1.1, 0.1))
+    axes[0].set_ylim(0, 1.05)
+    axes[0].legend(loc='lower right')
+    axes[0].grid(axis='y', linestyle='--', alpha=0.7)
+    
+    # Plot AJI and PQ in the second subplot
+    axes[1].bar(index - bar_width/2, aji_scores, bar_width, label='AJI', color='lightgreen')
+    axes[1].bar(index + bar_width/2, pq_scores, bar_width, label='PQ', color='plum')
+    
+    for i, count in enumerate(sample_counts):
+        axes[1].text(i, max(aji_scores[i], pq_scores[i]) + 0.01, f"n={count}", ha='center', va='bottom', fontsize=8)
+    
+    axes[1].set_xlabel('Tissue Type', fontsize=12)
+    axes[1].set_ylabel('Score', fontsize=12)
+    axes[1].set_title('AJI and PQ by Tissue Type', fontsize=14)
+    axes[1].set_xticks(index)
+    axes[1].set_xticklabels([name.replace('_', ' \n') for name in tissue_names], rotation=90, ha='center', fontsize=9)
+    axes[1].set_yticks(np.arange(0, 1.1, 0.1))
+    axes[1].set_ylim(0, 1.05)
+    axes[1].legend(loc='lower right')
+    axes[1].grid(axis='y', linestyle='--', alpha=0.7)
+    
     plt.tight_layout()
     plt.savefig(save_path, dpi=150)
+    plt.close(fig)
+    
+    # Also create a separate file with the average metric values
+    plt.figure(figsize=(10, 6))
+    metrics_names = ['Dice', 'IoU', 'AJI', 'PQ']
+    metrics_values = [np.mean(dice_scores), np.mean(iou_scores), np.mean(aji_scores), np.mean(pq_scores)]
+    
+    plt.bar(metrics_names, metrics_values, color=['skyblue', 'lightcoral', 'lightgreen', 'plum'])
+    plt.axhline(y=np.mean(metrics_values), color='gray', linestyle='--', alpha=0.7)
+    
+    plt.ylim(0, 1.0)
+    plt.title('Average Metric Performance', fontsize=14)
+    plt.ylabel('Score', fontsize=12)
+    plt.grid(axis='y', linestyle='--', alpha=0.5)
+    
+    # Add value labels on top of bars
+    for i, v in enumerate(metrics_values):
+        plt.text(i, v + 0.02, f"{v:.4f}", ha='center', fontsize=10)
+        
+    plot_dir = os.path.dirname(save_path)
+    plt.savefig(os.path.join(plot_dir, 'average_metrics.png'), dpi=150)
     plt.close()
 
 
@@ -335,4 +621,4 @@ if __name__ == '__main__':
     args = parser.parse_args()
     
     # Run evaluation
-    evaluate(args) 
+    main_evaluate(args) 

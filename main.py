@@ -83,6 +83,12 @@ import sys
 import torch
 import numpy as np
 import random
+import warnings
+
+# Filter specific warnings
+warnings.filterwarnings("ignore", message="Importing from timm.models.layers is deprecated")
+warnings.filterwarnings("ignore", message="Importing from timm.models.registry is deprecated")
+warnings.filterwarnings("ignore", message="Overwriting tiny_vit_*")
 
 # Import functions from other modules
 from train import main_train
@@ -103,8 +109,8 @@ def set_seed(seed):
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Main script for MobileSAM Nuclei Segmentation')
-    parser.add_argument('mode', choices=['train', 'evaluate', 'demo', 'download'], 
-                        help='Operation mode: train, evaluate, demo, or download weights')
+    parser.add_argument('mode', choices=['train', 'evaluate', 'demo', 'download', 'parameter_search'], 
+                        help='Operation mode: train, evaluate, demo, download weights, or parameter_search')
     parser.add_argument('--seed', type=int, default=42, help='Global random seed')
     
     # Add arguments common to multiple modes or allow unknown args
@@ -144,6 +150,9 @@ def parse_args():
         train_parser.add_argument('--save_interval', type=int, default=10)
         train_parser.add_argument('--early_stopping', action=argparse.BooleanOptionalAction, default=True)
         train_parser.add_argument('--patience', type=int, default=20)
+        # Cross-validation parameters
+        train_parser.add_argument('--cross_validation', action=argparse.BooleanOptionalAction, default=True)
+        train_parser.add_argument('--num_folds', type=int, default=5)
         # Add seed again for consistency, it will be overwritten by the main parser's seed
         train_parser.add_argument('--seed', type=int, default=42)
         # Parse the *remaining* arguments using the train parser
@@ -182,6 +191,45 @@ def parse_args():
         dl_parser.add_argument('--force', action="store_true")
         mode_args = dl_parser.parse_args(remaining_argv)
         
+    elif args.mode == 'parameter_search':
+        # Parameter search mode
+        ps_parser = argparse.ArgumentParser(description='Parameter Search Arguments')
+        ps_parser.add_argument('--data_dir', type=str, default='NuInsSeg')
+        ps_parser.add_argument('--image_size', type=int, default=1024)
+        ps_parser.add_argument('--num_workers', type=int, default=4)
+        ps_parser.add_argument('--pretrained', type=str, default='weights/mobile_sam.pt')
+        ps_parser.add_argument('--train_encoder', action=argparse.BooleanOptionalAction, default=True)
+        ps_parser.add_argument('--train_decoder', action=argparse.BooleanOptionalAction, default=False)
+        ps_parser.add_argument('--train_only_lora', action=argparse.BooleanOptionalAction, default=True)
+        ps_parser.add_argument('--lora_dropout', type=float, default=0.1, help='Dropout probability for LoRA layers')
+        ps_parser.add_argument('--batch_size', type=int, default=4)
+        ps_parser.add_argument('--epochs', type=int, default=30)  # Shorter epochs for search
+        ps_parser.add_argument('--optimizer', type=str, default='adamw', choices=['adam', 'adamw', 'sgd'])
+        ps_parser.add_argument('--lr_scheduler', type=str, default='cosine', choices=['cosine', 'step', 'reduce', 'none'])
+        ps_parser.add_argument('--lr_step_size', type=int, default=30)
+        ps_parser.add_argument('--lr_gamma', type=float, default=0.1)
+        ps_parser.add_argument('--lr_patience', type=int, default=10)
+        ps_parser.add_argument('--min_lr', type=float, default=1e-6)
+        ps_parser.add_argument('--weight_decay', type=float, default=1e-4)
+        ps_parser.add_argument('--grad_clip', type=float, default=1.0)
+        ps_parser.add_argument('--dice_weight', type=float, default=0.5)
+        ps_parser.add_argument('--focal_weight', type=float, default=0.5)
+        ps_parser.add_argument('--early_stopping', action=argparse.BooleanOptionalAction, default=True)
+        ps_parser.add_argument('--patience', type=int, default=15)
+        ps_parser.add_argument('--output_dir', type=str, default='parameter_search')
+        ps_parser.add_argument('--save_interval', type=int, default=10)
+        # Parameter search specific arguments
+        ps_parser.add_argument('--lora_ranks', type=str, default='2,4,8,16', 
+                               help='Comma-separated list of LoRA ranks to try')
+        ps_parser.add_argument('--lora_alphas', type=str, default='2,4,8', 
+                               help='Comma-separated list of LoRA alphas to try')
+        ps_parser.add_argument('--learning_rates', type=str, default='1e-4,3e-4,1e-3', 
+                               help='Comma-separated list of learning rates to try')
+        # Cross-validation for parameter search
+        ps_parser.add_argument('--num_folds', type=int, default=3)  # Smaller folds for faster search
+        ps_parser.add_argument('--seed', type=int, default=42)
+        mode_args = ps_parser.parse_args(remaining_argv)
+        
     else:
         # Should not happen due to choices constraint
         parser.print_help()
@@ -194,6 +242,98 @@ def parse_args():
     final_args.seed = args.seed 
     
     return final_args
+
+def parameter_search(args):
+    """
+    Perform parameter search over different LoRA configurations.
+    """
+    # Parse parameter search ranges
+    lora_ranks = [int(r) for r in args.lora_ranks.split(',')]
+    lora_alphas = [int(a) for a in args.lora_alphas.split(',')]
+    learning_rates = [float(lr) for lr in args.learning_rates.split(',')]
+    
+    print(f"Starting parameter search with:")
+    print(f"  LoRA ranks: {lora_ranks}")
+    print(f"  LoRA alphas: {lora_alphas}")
+    print(f"  Learning rates: {learning_rates}")
+    print(f"  Using {args.num_folds}-fold cross-validation for each configuration\n")
+    
+    # Create output directory for search
+    import os
+    from pathlib import Path
+    os.makedirs(args.output_dir, exist_ok=True)
+    
+    # Track best configuration
+    best_dice = 0.0
+    best_config = None
+    results = {}
+    
+    # Setup shared params for all runs
+    from copy import deepcopy
+    total_configs = len(lora_ranks) * len(lora_alphas) * len(learning_rates)
+    config_idx = 0
+    
+    for lora_rank in lora_ranks:
+        for lora_alpha in lora_alphas:
+            for lr in learning_rates:
+                config_idx += 1
+                print(f"\n--- Configuration {config_idx}/{total_configs} ---")
+                print(f"LoRA rank: {lora_rank}, Alpha: {lora_alpha}, LR: {lr}")
+                
+                # Create args for this configuration
+                config_args = deepcopy(args)
+                config_args.lora_rank = lora_rank
+                config_args.lora_alpha = lora_alpha
+                config_args.learning_rate = lr
+                config_args.cross_validation = True
+                config_args.output_dir = os.path.join(args.output_dir, f"rank{lora_rank}_alpha{lora_alpha}_lr{lr}")
+                
+                # Run training with cross-validation
+                from train import train
+                val_dice, test_dice = train(config_args)
+                
+                # Record results
+                config_key = f"rank{lora_rank}_alpha{lora_alpha}_lr{lr}"
+                results[config_key] = {
+                    "val_dice": val_dice,
+                    "test_dice": test_dice,
+                    "lora_rank": lora_rank,
+                    "lora_alpha": lora_alpha,
+                    "learning_rate": lr
+                }
+                
+                # Update best if needed
+                if val_dice > best_dice:
+                    best_dice = val_dice
+                    best_config = {
+                        "lora_rank": lora_rank,
+                        "lora_alpha": lora_alpha,
+                        "learning_rate": lr,
+                        "val_dice": val_dice,
+                        "test_dice": test_dice
+                    }
+    
+    # Save all results
+    import json
+    summary = {
+        "results": results,
+        "best_config": best_config
+    }
+    
+    with open(os.path.join(args.output_dir, "parameter_search_results.json"), "w") as f:
+        json.dump(summary, f, indent=4)
+    
+    # Print summary
+    print("\n=== Parameter Search Results ===")
+    for config_key, result in sorted(results.items(), key=lambda x: x[1]["val_dice"], reverse=True):
+        print(f"{config_key}: Val Dice = {result['val_dice']:.4f}, Test Dice = {result['test_dice']:.4f}")
+    
+    print(f"\nBest configuration: Rank {best_config['lora_rank']}, Alpha {best_config['lora_alpha']}, LR {best_config['learning_rate']}")
+    print(f"Best validation Dice: {best_config['val_dice']:.4f}")
+    print(f"Best test Dice: {best_config['test_dice']:.4f}")
+    print(f"Results saved to {args.output_dir}/parameter_search_results.json")
+    
+    return best_config
 
 if __name__ == "__main__":
     args = parse_args()
@@ -215,6 +355,68 @@ if __name__ == "__main__":
     elif args.mode == 'download':
         print("\n--- Running Download ---")
         main_download(args)
+    elif args.mode == 'parameter_search':
+        print("\n--- Running Parameter Search ---")
+        parameter_search(args)
         
     print(f"\n--- {args.mode.capitalize()} finished ---")
 
+
+
+# Download pre-trained MobileSAM weights:
+# python main.py download --output_dir weights
+
+# Parameter search to find optimal LoRA configuration:
+# python main.py parameter_search --data_dir NuInsSeg --output_dir parameter_search --lora_ranks 2,4,8,16 --lora_alphas 2,4,8 --learning_rates 1e-4,3e-4,1e-3 --epochs 30 --num_folds 3
+
+# Train the model with optimal configuration and 5-fold cross-validation:
+# python main.py train --data_dir NuInsSeg --output_dir output_lora_optimal --pretrained weights/mobile_sam.pt --batch_size 4 --learning_rate 3e-4 --epochs 50 --early_stopping --patience 15 --lora_rank 8 --lora_alpha 8 --train_only_lora --cross_validation --num_folds 5
+
+# Standard training without cross-validation (if preferred):
+# python main.py train --data_dir NuInsSeg --output_dir output_lora_standard --pretrained weights/mobile_sam.pt --batch_size 4 --learning_rate 3e-4 --epochs 50 --early_stopping --patience 15 --lora_rank 8 --lora_alpha 8 --train_only_lora --no-cross_validation
+
+# Evaluate model performance (repeat for each fold as needed):
+# python main.py evaluate --data_dir NuInsSeg --model_path output_lora_optimal/fold_1/best_model.pth --output_dir evaluation_lora_optimal/fold_1 --visualize --plot
+
+# Run the demo to visualize results on sample images:
+# python main.py demo --data_dir NuInsSeg --model_path output_lora_optimal/fold_1/best_model.pth --output_dir demo_lora_optimal --num_samples 10
+
+# Evaluation Results from fold 1:
+# Metrics by tissue type:
+#   human bladder (3 samples): IoU: 0.7313, Dice: 0.8447, AJI: 0.5787, PQ: 0.3991
+#   human cardia (4 samples): IoU: 0.7238, Dice: 0.8381, AJI: 0.4811, PQ: 0.2309
+#   human cerebellum (2 samples): IoU: 0.7960, Dice: 0.8864, AJI: 0.6458, PQ: 0.4582
+#   human epiglottis (2 samples): IoU: 0.7785, Dice: 0.8716, AJI: 0.7043, PQ: 0.6031
+#   human jejunum (2 samples): IoU: 0.7585, Dice: 0.8627, AJI: 0.2417, PQ: 0.1815
+#   human kidney (2 samples): IoU: 0.8181, Dice: 0.9000, AJI: 0.4343, PQ: 0.2590
+#   human liver (12 samples): IoU: 0.7297, Dice: 0.8431, AJI: 0.5937, PQ: 0.4325
+#   human lung (1 samples): IoU: 0.7622, Dice: 0.8650, AJI: 0.6000, PQ: 0.4016
+#   human melanoma (2 samples): IoU: 0.5194, Dice: 0.6836, AJI: 0.4211, PQ: 0.2469
+#   human muscle (1 samples): IoU: 0.4345, Dice: 0.6058, AJI: 0.6678, PQ: 0.3562
+#   human oesophagus (9 samples): IoU: 0.7936, Dice: 0.8842, AJI: 0.6474, PQ: 0.5501
+#   human pancreas (12 samples): IoU: 0.7250, Dice: 0.8399, AJI: 0.5721, PQ: 0.4075
+#   human peritoneum (2 samples): IoU: 0.6199, Dice: 0.7631, AJI: 0.5567, PQ: 0.3671
+#   human placenta (9 samples): IoU: 0.8135, Dice: 0.8953, AJI: 0.4982, PQ: 0.3546
+#   human pylorus (2 samples): IoU: 0.7786, Dice: 0.8752, AJI: 0.6298, PQ: 0.4271
+#   human salivory gland (6 samples): IoU: 0.7015, Dice: 0.8228, AJI: 0.4531, PQ: 0.3206
+#   human spleen (10 samples): IoU: 0.7333, Dice: 0.8453, AJI: 0.4377, PQ: 0.2706
+#   human testis (2 samples): IoU: 0.6673, Dice: 0.8004, AJI: 0.6581, PQ: 0.5379
+#   human tongue (5 samples): IoU: 0.7260, Dice: 0.8351, AJI: 0.5379, PQ: 0.4196
+#   human tonsile (1 samples): IoU: 0.6507, Dice: 0.7884, AJI: 0.5427, PQ: 0.2501
+#   human umbilical cord (3 samples): IoU: 0.4620, Dice: 0.6314, AJI: 0.4499, PQ: 0.1748
+#   mouse fat (white and brown)_subscapula (5 samples): IoU: 0.4777, Dice: 0.6374, AJI: 0.5714, PQ: 0.3955
+#   mouse femur (2 samples): IoU: 0.5562, Dice: 0.7128, AJI: 0.5038, PQ: 0.2183
+#   mouse heart (3 samples): IoU: 0.4855, Dice: 0.6517, AJI: 0.4825, PQ: 0.2436
+#   mouse kidney (8 samples): IoU: 0.6153, Dice: 0.7589, AJI: 0.5897, PQ: 0.4561
+#   mouse liver (9 samples): IoU: 0.4350, Dice: 0.5948, AJI: 0.5454, PQ: 0.3568
+#   mouse muscle_tibia (7 samples): IoU: 0.5287, Dice: 0.6802, AJI: 0.5450, PQ: 0.4123
+#   mouse spleen (6 samples): IoU: 0.6974, Dice: 0.8210, AJI: 0.1901, PQ: 0.0853
+#   mouse thymus (2 samples): IoU: 0.7388, Dice: 0.8498, AJI: 0.1277, PQ: 0.0767
+
+# Overall Results:
+#   IoU:  0.6726
+#   Dice: 0.7952
+#   AJI:  0.5197
+#   PQ:   0.3606
+#   SQ:   0.7384
+#   RQ:   0.4851

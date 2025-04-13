@@ -1,0 +1,263 @@
+{
+    "results": {
+        "rank2_alpha2_lr0.0001": {
+            "val_dice": 0.7765981504040905,
+            "test_dice": 0.7381043702948326,
+            "lora_rank": 2,
+            "lora_alpha": 2,
+            "learning_rate": 0.0001
+        },
+        "rank2_alpha2_lr0.0003": {
+            "val_dice": 0.8096823957231308,
+            "test_dice": 0.7758382447794373,
+            "lora_rank": 2,
+            "lora_alpha": 2,
+            "learning_rate": 0.0003
+        },
+        "rank2_alpha2_lr0.001": {
+            "val_dice": 0.8313489861977406,
+            "test_dice": 0.7973686357339224,
+            "lora_rank": 2,
+            "lora_alpha": 2,
+            "learning_rate": 0.001
+        },
+        "rank2_alpha4_lr0.0001": {
+            "val_dice": 0.7893382096901917,
+            "test_dice": 0.7545222359545091,
+            "lora_rank": 2,
+            "lora_alpha": 4,
+            "learning_rate": 0.0001
+        },
+        "rank2_alpha4_lr0.0003": {
+            "val_dice": 0.8155290031025553,
+            "test_dice": 0.783030709215239,
+            "lora_rank": 2,
+            "lora_alpha": 4,
+            "learning_rate": 0.0003
+        },
+        "rank2_alpha4_lr0.001": {
+            "val_dice": 0.8315226782081474,
+            "test_dice": 0.7964671645678726,
+            "lora_rank": 2,
+            "lora_alpha": 4,
+            "learning_rate": 0.001
+        },
+        "rank2_alpha8_lr0.0001": {
+            "val_dice": 0.8014610073505303,
+            "test_dice": 0.7619482833965151,
+            "lora_rank": 2,
+            "lora_alpha": 8,
+            "learning_rate": 0.0001
+        },
+        "rank2_alpha8_lr0.0003": {
+            "val_dice": 0.8226415183809067,
+            "test_dice": 0.7888886490288902,
+            "lora_rank": 2,
+            "lora_alpha": 8,
+            "learning_rate": 0.0003
+        },
+        "rank2_alpha8_lr0.001": {
+            "val_dice": 0.8348617497672383,
+            "test_dice": 0.7956040419784247,
+            "lora_rank": 2,
+            "lora_alpha": 8,
+            "learning_rate": 0.001
+        },
+        "rank4_alpha2_lr0.0001": {
+            "val_dice": 0.7760346669417162,
+            "test_dice": 0.7398255993338193,
+            "lora_rank": 4,
+            "lora_alpha": 2,
+            "learning_rate": 0.0001
+        },
+        "rank4_alpha2_lr0.0003": {
+            "val_dice": 0.8080281319781246,
+            "test_dice": 0.7732167027744592,
+            "lora_rank": 4,
+            "lora_alpha": 2,
+            "learning_rate": 0.0003
+        },
+        "rank4_alpha2_lr0.001": {
+            "val_dice": 0.8288833743486649,
+            "test_dice": 0.7957774254621244,
+            "lora_rank": 4,
+            "lora_alpha": 2,
+            "learning_rate": 0.001
+        },
+        "rank4_alpha4_lr0.0001": {
+            "val_dice": 0.7885234452720381,
+            "test_dice": 0.7527069081278408,
+            "lora_rank": 4,
+            "lora_alpha": 4,
+            "learning_rate": 0.0001
+        },
+        "rank4_alpha4_lr0.0003": {
+            "val_dice": 0.8178759273300823,
+            "test_dice": 0.7805166308786354,
+            "lora_rank": 4,
+            "lora_alpha": 4,
+            "learning_rate": 0.0003
+        },
+        "rank4_alpha4_lr0.001": {
+            "val_dice": 0.8352329761554033,
+            "test_dice": 0.7999933046453139,
+            "lora_rank": 4,
+            "lora_alpha": 4,
+            "learning_rate": 0.001
+        },
+        "rank4_alpha8_lr0.0001": {
+            "val_dice": 0.7993377834303766,
+            "test_dice": 0.759801857027353,
+            "lora_rank": 4,
+            "lora_alpha": 8,
+            "learning_rate": 0.0001
+        },
+        "rank4_alpha8_lr0.0003": {
+            "val_dice": 0.8227855323726295,
+            "test_dice": 0.7861940095237657,
+            "lora_rank": 4,
+            "lora_alpha": 8,
+            "learning_rate": 0.0003
+        },
+        "rank4_alpha8_lr0.001": {
+            "val_dice": 0.8367632077290462,
+            "test_dice": 0.8044780481095408,
+            "lora_rank": 4,
+            "lora_alpha": 8,
+            "learning_rate": 0.001
+        },
+        "rank8_alpha2_lr0.0001": {
+            "val_dice": 0.7763989812288529,
+            "test_dice": 0.7375389629719304,
+            "lora_rank": 8,
+            "lora_alpha": 2,
+            "learning_rate": 0.0001
+        },
+        "rank8_alpha2_lr0.0003": {
+            "val_dice": 0.8102253120169681,
+            "test_dice": 0.7746539635985505,
+            "lora_rank": 8,
+            "lora_alpha": 2,
+            "learning_rate": 0.0003
+        },
+        "rank8_alpha2_lr0.001": {
+            "val_dice": 0.8310033546553718,
+            "test_dice": 0.7958170450201222,
+            "lora_rank": 8,
+            "lora_alpha": 2,
+            "learning_rate": 0.001
+        },
+        "rank8_alpha4_lr0.0001": {
+            "val_dice": 0.7898878200441345,
+            "test_dice": 0.7535452065514584,
+            "lora_rank": 8,
+            "lora_alpha": 4,
+            "learning_rate": 0.0001
+        },
+        "rank8_alpha4_lr0.0003": {
+            "val_dice": 0.8178652973256559,
+            "test_dice": 0.7844762182703205,
+            "lora_rank": 8,
+            "lora_alpha": 4,
+            "learning_rate": 0.0003
+        },
+        "rank8_alpha4_lr0.001": {
+            "val_dice": 0.8343428842022887,
+            "test_dice": 0.8000652532951505,
+            "lora_rank": 8,
+            "lora_alpha": 4,
+            "learning_rate": 0.001
+        },
+        "rank8_alpha8_lr0.0001": {
+            "val_dice": 0.8009859155385922,
+            "test_dice": 0.7631757761917862,
+            "lora_rank": 8,
+            "lora_alpha": 8,
+            "learning_rate": 0.0001
+        },
+        "rank8_alpha8_lr0.0003": {
+            "val_dice": 0.8217059373855591,
+            "test_dice": 0.7894567105115629,
+            "lora_rank": 8,
+            "lora_alpha": 8,
+            "learning_rate": 0.0003
+        },
+        "rank8_alpha8_lr0.001": {
+            "val_dice": 0.8372290271979113,
+            "test_dice": 0.8000203721663531,
+            "lora_rank": 8,
+            "lora_alpha": 8,
+            "learning_rate": 0.001
+        },
+        "rank16_alpha2_lr0.0001": {
+            "val_dice": 0.7767086074902462,
+            "test_dice": 0.7422895805508483,
+            "lora_rank": 16,
+            "lora_alpha": 2,
+            "learning_rate": 0.0001
+        },
+        "rank16_alpha2_lr0.0003": {
+            "val_dice": 0.8106190684514168,
+            "test_dice": 0.7743127018797632,
+            "lora_rank": 16,
+            "lora_alpha": 2,
+            "learning_rate": 0.0003
+        },
+        "rank16_alpha2_lr0.001": {
+            "val_dice": 0.8314264437072297,
+            "test_dice": 0.795826703894372,
+            "lora_rank": 16,
+            "lora_alpha": 2,
+            "learning_rate": 0.001
+        },
+        "rank16_alpha4_lr0.0001": {
+            "val_dice": 0.7897008565755991,
+            "test_dice": 0.7525319100594988,
+            "lora_rank": 16,
+            "lora_alpha": 4,
+            "learning_rate": 0.0001
+        },
+        "rank16_alpha4_lr0.0003": {
+            "val_dice": 0.8186580309501061,
+            "test_dice": 0.7850554147187401,
+            "lora_rank": 16,
+            "lora_alpha": 4,
+            "learning_rate": 0.0003
+        },
+        "rank16_alpha4_lr0.001": {
+            "val_dice": 0.8351002758384771,
+            "test_dice": 0.8004587280984019,
+            "lora_rank": 16,
+            "lora_alpha": 4,
+            "learning_rate": 0.001
+        },
+        "rank16_alpha8_lr0.0001": {
+            "val_dice": 0.8019262868115026,
+            "test_dice": 0.7633128066857656,
+            "lora_rank": 16,
+            "lora_alpha": 8,
+            "learning_rate": 0.0001
+        },
+        "rank16_alpha8_lr0.0003": {
+            "val_dice": 0.8237387420784713,
+            "test_dice": 0.7892281851347756,
+            "lora_rank": 16,
+            "lora_alpha": 8,
+            "learning_rate": 0.0003
+        },
+        "rank16_alpha8_lr0.001": {
+            "val_dice": 0.837462597932571,
+            "test_dice": 0.8055180650131376,
+            "lora_rank": 16,
+            "lora_alpha": 8,
+            "learning_rate": 0.001
+        }
+    },
+    "best_config": {
+        "lora_rank": 16,
+        "lora_alpha": 8,
+        "learning_rate": 0.001,
+        "val_dice": 0.837462597932571,
+        "test_dice": 0.8055180650131376
+    }
+}

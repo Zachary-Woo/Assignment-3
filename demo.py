@@ -1,11 +1,8 @@
 import os
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
 import argparse
 import numpy as np
 import matplotlib.pyplot as plt
-from PIL import Image
 import cv2
 from pathlib import Path
 import random
@@ -42,7 +39,13 @@ def visualize_prediction(orig_image_rgb, prediction, output_path, threshold=0.5)
     """
     # Resize prediction to match original image size
     h, w = orig_image_rgb.shape[:2]
-    pred_mask_binary = (prediction.squeeze().cpu().numpy() > threshold).astype(np.uint8)
+    
+    # Convert prediction to numpy and resize if needed
+    pred_np = prediction.squeeze().cpu().numpy()
+    if pred_np.shape[0] != h or pred_np.shape[1] != w:
+        pred_np = cv2.resize(pred_np, (w, h), interpolation=cv2.INTER_NEAREST)
+    
+    pred_mask_binary = (pred_np > threshold).astype(np.uint8)
     
     green = np.array([0, 255, 0], dtype=np.uint8)
     red = np.array([255, 0, 0], dtype=np.uint8)
@@ -50,8 +53,11 @@ def visualize_prediction(orig_image_rgb, prediction, output_path, threshold=0.5)
     
     alpha = 0.4
     pred_overlay = orig_image_rgb.copy()
-    pred_idx = pred_mask_binary > 0
-    pred_overlay[pred_idx] = (alpha * red + (1 - alpha) * orig_image_rgb[pred_idx]).astype(np.uint8)
+    
+    # Use safe indexing with coordinates
+    pred_idx = np.where(pred_mask_binary > 0)
+    for i, j in zip(*pred_idx):
+        pred_overlay[i, j] = (alpha * red + (1 - alpha) * orig_image_rgb[i, j]).astype(np.uint8)
     
     fig, axes = plt.subplots(1, 3, figsize=(15, 5))
     fig.suptitle(f"Prediction (Threshold={threshold:.2f})")

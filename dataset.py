@@ -3,26 +3,29 @@ import random
 import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
-from PIL import Image
 import cv2
-from torchvision import transforms
-import glob
 from skimage import io
 import random
+from sklearn.model_selection import KFold
 
 class NuInsSegDataset(Dataset):
-    def __init__(self, root_dir, transform=None, mode='train', train_val_test_split=[0.7, 0.1, 0.2], seed=42):
+    def __init__(self, root_dir, transform=None, mode='train', train_val_test_split=[0.7, 0.1, 0.2], seed=42, 
+                 fold_idx=None, num_folds=None, cross_val_indices=None):
         """
         Args:
             root_dir (string): Directory with the NuInsSeg dataset.
             transform (callable, optional): Optional transform to be applied on a sample.
             mode (string): 'train', 'val', or 'test'
-            train_val_test_split (list): Ratios for train/val/test split
+            train_val_test_split (list): Ratios for train/val/test split (used if fold_idx is None)
             seed (int): Random seed for reproducibility
+            fold_idx (int, optional): Current fold index for cross-validation
+            num_folds (int, optional): Total number of folds for cross-validation
+            cross_val_indices (list, optional): Pre-computed indices for cross-validation
         """
         self.root_dir = root_dir
         self.transform = transform
         self.mode = mode
+        self.using_cross_val = fold_idx is not None and num_folds is not None
         
         # Find all tissue subfolders
         self.tissue_folders = [f for f in os.listdir(root_dir) if os.path.isdir(os.path.join(root_dir, f))]
@@ -49,20 +52,47 @@ class NuInsSegDataset(Dataset):
         # Set random seed for reproducibility
         random.seed(seed)
         
-        # Shuffle and split the dataset
-        random.shuffle(self.image_mask_pairs)
-        total_samples = len(self.image_mask_pairs)
-        train_size = int(train_val_test_split[0] * total_samples)
-        val_size = int(train_val_test_split[1] * total_samples)
+        if self.using_cross_val:
+            # Use K-fold cross-validation splitting
+            all_indices = list(range(len(self.image_mask_pairs)))
+            
+            if cross_val_indices is not None:
+                # Use pre-computed indices
+                train_indices, val_indices = cross_val_indices
+            else:
+                # Create new k-fold split
+                kf = KFold(n_splits=num_folds, shuffle=True, random_state=seed)
+                splits = list(kf.split(all_indices))
+                train_indices, val_indices = splits[fold_idx]
+                
+            if mode == 'train':
+                selected_indices = train_indices
+            elif mode == 'val':
+                selected_indices = val_indices
+            elif mode == 'test':
+                # For test set, we use a separate holdout set (20% of the data)
+                # This ensures consistent test set across all folds
+                random.seed(seed)  # Reset seed for consistent test split
+                random.shuffle(all_indices)
+                test_size = int(0.2 * len(all_indices))
+                selected_indices = all_indices[-test_size:]
+            
+            self.image_mask_pairs = [self.image_mask_pairs[i] for i in selected_indices]
+        else:
+            # Use fixed train/val/test split as before
+            random.shuffle(self.image_mask_pairs)
+            total_samples = len(self.image_mask_pairs)
+            train_size = int(train_val_test_split[0] * total_samples)
+            val_size = int(train_val_test_split[1] * total_samples)
+            
+            if mode == 'train':
+                self.image_mask_pairs = self.image_mask_pairs[:train_size]
+            elif mode == 'val':
+                self.image_mask_pairs = self.image_mask_pairs[train_size:train_size+val_size]
+            elif mode == 'test':
+                self.image_mask_pairs = self.image_mask_pairs[train_size+val_size:]
         
-        if mode == 'train':
-            self.image_mask_pairs = self.image_mask_pairs[:train_size]
-        elif mode == 'val':
-            self.image_mask_pairs = self.image_mask_pairs[train_size:train_size+val_size]
-        elif mode == 'test':
-            self.image_mask_pairs = self.image_mask_pairs[train_size+val_size:]
-        
-        print(f"Mode: {mode}, Total samples: {len(self.image_mask_pairs)}")
+        print(f"Mode: {mode}{' (Fold '+str(fold_idx+1)+'/'+str(num_folds)+')' if self.using_cross_val and mode != 'test' else ''}, Total samples: {len(self.image_mask_pairs)}")
     
     def __len__(self):
         return len(self.image_mask_pairs)
@@ -205,6 +235,16 @@ class ToTensor:
         return {'image': image, 'mask': mask}
 
 
+class ComposedTransforms:
+    def __init__(self, transforms_list):
+        self.transforms_list = transforms_list
+    
+    def __call__(self, sample):
+        for transform in self.transforms_list:
+            sample = transform(sample)
+        return sample
+
+
 def get_transform(mode='train', image_size=1024):
     transforms_list = []
     
@@ -227,34 +267,52 @@ def get_transform(mode='train', image_size=1024):
     ])
     
     # Create a composed transform
-    def composed_transforms(sample):
-        for transform in transforms_list:
-            sample = transform(sample)
-        return sample
-    
-    return composed_transforms
+    return ComposedTransforms(transforms_list)
 
 
-def create_dataloaders(root_dir, batch_size=4, image_size=1024, num_workers=4):
+def create_dataloaders(root_dir, batch_size=4, image_size=1024, num_workers=4, seed=42, 
+                      fold_idx=None, num_folds=None, cross_val_indices=None):
     """
     Create dataloaders for training, validation, and testing
+    
+    Args:
+        root_dir: Path to the NuInsSeg dataset
+        batch_size: Batch size for dataloaders
+        image_size: Target image size
+        num_workers: Number of workers for dataloaders
+        seed: Random seed for dataset splitting
+        fold_idx: Current fold index for cross-validation (None for standard split)
+        num_folds: Total number of folds for cross-validation
+        cross_val_indices: Pre-computed indices for cross-validation
     """
     train_dataset = NuInsSegDataset(
         root_dir=root_dir,
         transform=get_transform(mode='train', image_size=image_size),
-        mode='train'
+        mode='train',
+        seed=seed,
+        fold_idx=fold_idx,
+        num_folds=num_folds,
+        cross_val_indices=cross_val_indices
     )
     
     val_dataset = NuInsSegDataset(
         root_dir=root_dir,
         transform=get_transform(mode='val', image_size=image_size),
-        mode='val'
+        mode='val',
+        seed=seed,
+        fold_idx=fold_idx,
+        num_folds=num_folds,
+        cross_val_indices=cross_val_indices
     )
     
     test_dataset = NuInsSegDataset(
         root_dir=root_dir,
         transform=get_transform(mode='test', image_size=image_size),
-        mode='test'
+        mode='test',
+        seed=seed,
+        fold_idx=fold_idx,
+        num_folds=num_folds,
+        cross_val_indices=cross_val_indices
     )
     
     train_loader = DataLoader(
@@ -282,4 +340,31 @@ def create_dataloaders(root_dir, batch_size=4, image_size=1024, num_workers=4):
         pin_memory=True
     )
     
-    return train_loader, val_loader, test_loader 
+    return train_loader, val_loader, test_loader
+
+def create_cross_val_indices(root_dir, num_folds=5, seed=42):
+    """
+    Pre-compute cross-validation indices to ensure consistent splits
+    
+    Args:
+        root_dir: Path to the NuInsSeg dataset
+        num_folds: Number of folds for cross-validation
+        seed: Random seed for reproducibility
+        
+    Returns:
+        List of (train_indices, val_indices) for each fold
+    """
+    # Simulate dataset creation to get image_mask_pairs
+    dataset = NuInsSegDataset(root_dir=root_dir, mode='train', seed=seed)
+    all_pairs = dataset.image_mask_pairs
+    
+    # Create k-fold split
+    kf = KFold(n_splits=num_folds, shuffle=True, random_state=seed)
+    all_indices = list(range(len(all_pairs)))
+    
+    # Get all splits
+    cross_val_splits = []
+    for train_idx, val_idx in kf.split(all_indices):
+        cross_val_splits.append((train_idx, val_idx))
+    
+    return cross_val_splits 
