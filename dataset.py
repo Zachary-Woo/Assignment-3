@@ -70,7 +70,7 @@ class NuInsSegDataset(Dataset):
             elif mode == 'val':
                 selected_indices = val_indices
             elif mode == 'test':
-                # For test set, we use a separate holdout set (20% of the data)
+                # For test set, I use a separate holdout set (20% of the data)
                 # This ensures consistent test set across all folds
                 random.seed(seed)  # Reset seed for consistent test split
                 random.shuffle(all_indices)

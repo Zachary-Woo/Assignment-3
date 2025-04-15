@@ -28,8 +28,7 @@ class LoRALinear(nn.Module):
         original_layer: nn.Linear, 
         r: int = 4, 
         lora_alpha: int = 4, 
-        lora_dropout: float = 0.0,
-        merge_weights: bool = False, # Merging not fully supported here easily
+        lora_dropout: float = 0.0
     ):
         """
         Initialize LoRA-adapted linear layer.
@@ -39,7 +38,6 @@ class LoRALinear(nn.Module):
             r: Rank of the low-rank adaptation matrices
             lora_alpha: Scaling factor for the LoRA contribution
             lora_dropout: Dropout probability applied before LoRA adaptation
-            merge_weights: Flag for weight merging (not fully implemented)
         """
         super().__init__()
         

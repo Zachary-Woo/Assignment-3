@@ -2,7 +2,6 @@ import os
 import argparse
 import urllib.request
 import sys
-from pathlib import Path
 
 def download_file(url, destination, force=False):
     """
