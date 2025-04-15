@@ -12,7 +12,7 @@ from lora import MobileSAM_LoRA_Adapted
 
 def load_image(image_path, image_size=1024):
     """
-    Load and preprocess an image for the model
+    Gets an image ready for the model - loads, resizes, and normalizes it
     """
     # Load image
     image_bgr = cv2.imread(image_path)
@@ -35,7 +35,7 @@ def load_image(image_path, image_size=1024):
 
 def visualize_prediction(orig_image_rgb, prediction, output_path, threshold=0.5):
     """
-    Visualize the model's prediction on an image
+    Creates a nice visualization showing the model's predictions on an image
     """
     # Resize prediction to match original image size
     h, w = orig_image_rgb.shape[:2]

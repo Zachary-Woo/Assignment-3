@@ -20,68 +20,124 @@ from lora import MobileSAM_LoRA_Adapted
 
 # Loss functions
 class DiceLoss(nn.Module):
+    """
+    Implementation of the Dice Loss, a region-based metric commonly used for medical image segmentation.
+    
+    The Dice coefficient quantifies the spatial overlap between two binary volumes, and this loss
+    represents 1 - Dice coefficient to be minimized during training.
+    """
     def __init__(self, smooth=1.0):
+        """
+        Initialize Dice Loss with a smoothing factor to prevent division by zero.
+        
+        Args:
+            smooth: Small constant added to numerator and denominator to prevent numerical instability
+        """
         super(DiceLoss, self).__init__()
         self.smooth = smooth
     
     def forward(self, pred, target):
+        """
+        Compute the Dice Loss between predicted and target segmentation masks.
+        
+        Args:
+            pred: Model predictions (B, C, H, W)
+            target: Ground truth masks (B, H, W)
+            
+        Returns:
+            Dice Loss value (1 - Dice coefficient)
+        """
         binary_target = (target > 0).float()
-        # Handle cases where pred might be None (e.g., error during forward)
+        # Error handling for null predictions
         if pred is None:
              print("Warning: DiceLoss received None prediction.")
-             return torch.tensor(1.0, device=target.device) # Return max loss
+             return torch.tensor(1.0, device=target.device) # Return maximum loss
              
+        # Process prediction based on channel dimension
         if pred.shape[1] > 1:
-            # Assuming the first channel is the foreground mask
+            # Extract foreground channel if multi-channel output
             pred = torch.sigmoid(pred[:, 0, :, :]) 
         else:
             pred = torch.sigmoid(pred.squeeze(1))
             
+        # Flatten spatial dimensions for computation
         pred_flat = pred.view(pred.size(0), -1)
         target_flat = binary_target.view(target.size(0), -1)
         
+        # Calculate intersection and union for Dice coefficient
         intersection = (pred_flat * target_flat).sum(1)
         union = pred_flat.sum(1) + target_flat.sum(1)
         
+        # Compute Dice coefficient with smoothing factor
         dice = (2. * intersection + self.smooth) / (union + self.smooth)
         
-        return (1 - dice).mean() # Average loss over batch
+        return (1 - dice).mean() # Return batch-averaged Dice Loss
 
 class FocalLoss(nn.Module):
+    """
+    Implementation of Focal Loss, designed to address class imbalance by down-weighting well-classified examples.
+    
+    Focal Loss modifies standard cross-entropy by adding a factor that reduces the loss contribution
+    from easy examples and increases the importance of correcting misclassified examples.
+    """
     def __init__(self, alpha=0.25, gamma=2.0, reduction='mean'):
+        """
+        Initialize Focal Loss with focusing parameters.
+        
+        Args:
+            alpha: Weighting factor for the rare class (typically foreground)
+            gamma: Focusing parameter that adjusts the rate at which easy examples are down-weighted
+            reduction: Method to reduce loss over batch ('mean', 'sum', or 'none')
+        """
         super(FocalLoss, self).__init__()
         self.alpha = alpha
         self.gamma = gamma
         self.reduction = reduction
     
     def forward(self, pred, target):
+        """
+        Compute the Focal Loss between predicted and target segmentation masks.
+        
+        Args:
+            pred: Model predictions (B, C, H, W)
+            target: Ground truth masks (B, H, W)
+            
+        Returns:
+            Focal Loss value
+        """
         binary_target = (target > 0).float()
         
+        # Error handling for null predictions
         if pred is None:
              print("Warning: FocalLoss received None prediction.")
-             # Return a high loss value or handle appropriately
              return torch.tensor(10.0, device=target.device) 
 
+        # Process prediction based on channel dimension
         if pred.shape[1] > 1:
             pred = torch.sigmoid(pred[:, 0, :, :]) 
         else:
             pred = torch.sigmoid(pred.squeeze(1))
             
+        # Flatten spatial dimensions for computation
         binary_target = binary_target.view(-1)
         pred = pred.view(-1)
         
-        # Ensure pred is clamped to avoid log(0)
+        # Numerical stability: prevent logarithm of zero
         eps = 1e-8
         pred = torch.clamp(pred, eps, 1. - eps)
         
+        # Compute probabilities for the given class
         pt = pred * binary_target + (1 - pred) * (1 - binary_target)
+        # Apply alpha balancing
         alpha_factor = self.alpha * binary_target + (1 - self.alpha) * (1 - binary_target)
+        # Apply focusing factor (1-pt)^gamma
         modulating_factor = (1.0 - pt) ** self.gamma
         
-        # Use Binary Cross Entropy loss calculation format for numerical stability
+        # Calculate focal loss using binary cross entropy as base
         bce_loss = F.binary_cross_entropy(pred, binary_target, reduction='none')
         loss = alpha_factor * modulating_factor * bce_loss
         
+        # Apply specified reduction method
         if self.reduction == 'mean':
             return loss.mean()
         elif self.reduction == 'sum':
@@ -89,9 +145,24 @@ class FocalLoss(nn.Module):
         else:
             return loss
 
-# Combined loss
 class CombinedLoss(nn.Module):
+    """
+    Weighted combination of Dice Loss and Focal Loss for improved segmentation performance.
+    
+    This combined approach balances the region-based properties of Dice Loss with
+    the class-balanced pixel-wise focus of Focal Loss.
+    """
     def __init__(self, dice_weight=0.5, focal_weight=0.5, smooth=1.0, alpha=0.25, gamma=2.0):
+        """
+        Initialize Combined Loss with weighting parameters.
+        
+        Args:
+            dice_weight: Weight assigned to Dice Loss component
+            focal_weight: Weight assigned to Focal Loss component
+            smooth: Smoothing factor for Dice Loss
+            alpha: Class balancing factor for Focal Loss
+            gamma: Focusing parameter for Focal Loss
+        """
         super(CombinedLoss, self).__init__()
         self.dice_weight = dice_weight
         self.focal_weight = focal_weight
@@ -99,9 +170,18 @@ class CombinedLoss(nn.Module):
         self.focal_loss = FocalLoss(alpha, gamma)
     
     def forward(self, pred, target):
+        """
+        Compute the weighted combination of Dice and Focal losses.
+        
+        Args:
+            pred: Model predictions (B, C, H, W)
+            target: Ground truth masks (B, H, W)
+            
+        Returns:
+            Weighted sum of Dice and Focal losses
+        """
         if pred is None:
              print("Warning: CombinedLoss received None prediction.")
-             # Return a combined high loss value
              return torch.tensor(11.0, device=target.device) 
              
         dice = self.dice_loss(pred, target)
@@ -110,34 +190,50 @@ class CombinedLoss(nn.Module):
 
 # Evaluation metrics
 def calculate_metrics(pred, target, threshold=0.5):
+    """
+    Calculate Intersection over Union (IoU) and Dice coefficient metrics for segmentation evaluation.
+    
+    Args:
+        pred: Model predictions (B, C, H, W)
+        target: Ground truth masks (B, H, W)
+        threshold: Probability threshold for converting predictions to binary masks
+        
+    Returns:
+        Dictionary containing IoU and Dice metrics
+    """
     if pred is None or target is None:
-        # print("Warning: calculate_metrics received None input.")
         return {'IoU': 0.0, 'Dice': 0.0}
-    with torch.no_grad(): # Ensure no gradients are calculated here
+    
+    with torch.no_grad(): # Disable gradient computation for efficiency
+         # Extract appropriate channel if multi-channel output
          if pred.shape[1] > 1:
              pred = pred[:, 0, :, :] # Select first channel
          else:
              pred = pred.squeeze(1)
-         # Apply sigmoid and threshold
+         
+         # Apply sigmoid and threshold to get binary predictions
          pred = (torch.sigmoid(pred) > threshold).float()
          binary_target = (target > 0).float()
          
-         # Flatten for calculation
+         # Flatten spatial dimensions for computation
          pred_flat = pred.view(pred.size(0), -1)
          target_flat = binary_target.view(target.size(0), -1)
          
+         # Calculate intersection, union, and sums for metrics
          intersection = (pred_flat * target_flat).sum(1)
          pred_sum = pred_flat.sum(1)
          target_sum = target_flat.sum(1)
          union = pred_sum + target_sum - intersection
          
+         # Calculate IoU and Dice with small epsilon for numerical stability
          iou = (intersection + 1e-8) / (union + 1e-8)
          dice = (2 * intersection + 1e-8) / (pred_sum + target_sum + 1e-8)
          
-         # Handle potential division by zero if both pred and target are empty
+         # Handle edge cases where both prediction and target are empty
          iou[union == 0] = 1.0
          dice[pred_sum + target_sum == 0] = 1.0
          
+         # Average metrics across batch
          mean_iou = iou.mean().item()
          mean_dice = dice.mean().item()
          

@@ -97,13 +97,21 @@ from demo import main as main_demo # Renamed to avoid conflict
 from download_weights import main as main_download
 
 def set_seed(seed):
-    """Sets the seed for reproducibility."""
+    """
+    Establishes deterministic behavior for reproducible experiments.
+    
+    Sets random seeds for PyTorch, NumPy, and Python's random module to ensure
+    consistent results across multiple runs with the same seed value.
+    
+    Args:
+        seed: Integer seed value for random number generators
+    """
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
     np.random.seed(seed)
     random.seed(seed)
-    # Potentially add torch.backends.cudnn settings if needed
+    # Uncomment for complete determinism (may impact performance):
     # torch.backends.cudnn.deterministic = True
     # torch.backends.cudnn.benchmark = False
 
@@ -245,9 +253,20 @@ def parse_args():
 
 def parameter_search(args):
     """
-    Perform parameter search over different LoRA configurations.
+    Performs hyperparameter optimization for the LoRA architecture.
+    
+    This function conducts a grid search over specified hyperparameter combinations,
+    specifically exploring different LoRA ranks, alpha scaling factors, and learning rates.
+    For each configuration, it performs k-fold cross-validation training and tracks
+    validation and test performance to identify optimal settings.
+    
+    Args:
+        args: Namespace containing configuration parameters
+        
+    Returns:
+        Dictionary containing the best hyperparameter configuration
     """
-    # Parse parameter search ranges
+    # Parse parameter search space from comma-separated strings
     lora_ranks = [int(r) for r in args.lora_ranks.split(',')]
     lora_alphas = [int(a) for a in args.lora_alphas.split(',')]
     learning_rates = [float(lr) for lr in args.learning_rates.split(',')]
@@ -258,21 +277,22 @@ def parameter_search(args):
     print(f"  Learning rates: {learning_rates}")
     print(f"  Using {args.num_folds}-fold cross-validation for each configuration\n")
     
-    # Create output directory for search
+    # Create output directory for search results
     import os
     from pathlib import Path
     os.makedirs(args.output_dir, exist_ok=True)
     
-    # Track best configuration
+    # Initialize tracking variables
     best_dice = 0.0
     best_config = None
     results = {}
     
-    # Setup shared params for all runs
+    # Setup for grid search
     from copy import deepcopy
     total_configs = len(lora_ranks) * len(lora_alphas) * len(learning_rates)
     config_idx = 0
     
+    # Grid search across all hyperparameter combinations
     for lora_rank in lora_ranks:
         for lora_alpha in lora_alphas:
             for lr in learning_rates:
@@ -280,7 +300,7 @@ def parameter_search(args):
                 print(f"\n--- Configuration {config_idx}/{total_configs} ---")
                 print(f"LoRA rank: {lora_rank}, Alpha: {lora_alpha}, LR: {lr}")
                 
-                # Create args for this configuration
+                # Create configuration-specific args
                 config_args = deepcopy(args)
                 config_args.lora_rank = lora_rank
                 config_args.lora_alpha = lora_alpha
@@ -288,11 +308,11 @@ def parameter_search(args):
                 config_args.cross_validation = True
                 config_args.output_dir = os.path.join(args.output_dir, f"rank{lora_rank}_alpha{lora_alpha}_lr{lr}")
                 
-                # Run training with cross-validation
+                # Execute training with cross-validation for this configuration
                 from train import train
                 val_dice, test_dice = train(config_args)
                 
-                # Record results
+                # Record results for this configuration
                 config_key = f"rank{lora_rank}_alpha{lora_alpha}_lr{lr}"
                 results[config_key] = {
                     "val_dice": val_dice,
@@ -302,7 +322,7 @@ def parameter_search(args):
                     "learning_rate": lr
                 }
                 
-                # Update best if needed
+                # Update best configuration if current one is superior
                 if val_dice > best_dice:
                     best_dice = val_dice
                     best_config = {
@@ -313,17 +333,18 @@ def parameter_search(args):
                         "test_dice": test_dice
                     }
     
-    # Save all results
+    # Serialize and save results
     import json
     summary = {
         "results": results,
         "best_config": best_config
     }
     
-    with open(os.path.join(args.output_dir, "parameter_search_results.json"), "w") as f:
+    results_path = os.path.join(args.output_dir, "parameter_search_results.json")
+    with open(results_path, "w") as f:
         json.dump(summary, f, indent=4)
     
-    # Print summary
+    # Display sorted results summary
     print("\n=== Parameter Search Results ===")
     for config_key, result in sorted(results.items(), key=lambda x: x[1]["val_dice"], reverse=True):
         print(f"{config_key}: Val Dice = {result['val_dice']:.4f}, Test Dice = {result['test_dice']:.4f}")
@@ -331,7 +352,7 @@ def parameter_search(args):
     print(f"\nBest configuration: Rank {best_config['lora_rank']}, Alpha {best_config['lora_alpha']}, LR {best_config['learning_rate']}")
     print(f"Best validation Dice: {best_config['val_dice']:.4f}")
     print(f"Best test Dice: {best_config['test_dice']:.4f}")
-    print(f"Results saved to {args.output_dir}/parameter_search_results.json")
+    print(f"Results saved to {results_path}")
     
     return best_config
 
@@ -381,7 +402,7 @@ if __name__ == "__main__":
 # Run the demo to visualize results on sample images:
 # python main.py demo --data_dir NuInsSeg --model_path output_lora_optimal/fold_1/best_model.pth --output_dir demo_lora_optimal --num_samples 10
 
-# Evaluation Results from fold 1:
+# Evaluation Results from fold 1 (Full results in the Readme):
 # Metrics by tissue type:
 #   human bladder (3 samples): IoU: 0.7313, Dice: 0.8447, AJI: 0.5787, PQ: 0.3991
 #   human cardia (4 samples): IoU: 0.7238, Dice: 0.8381, AJI: 0.4811, PQ: 0.2309

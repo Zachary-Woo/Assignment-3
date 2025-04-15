@@ -1,14 +1,11 @@
 import os
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
 import argparse
 import numpy as np
 from tqdm import tqdm
 import json
 from pathlib import Path
 import matplotlib.pyplot as plt
-from skimage import io
 import cv2
 import random # Import random for seed setting
 from skimage import measure # For connected components
@@ -22,39 +19,48 @@ from train import calculate_metrics
 # Add instance segmentation metrics
 def calculate_aji(pred_mask, true_mask):
     """
-    Calculate Aggregated Jaccard Index (AJI) for instance segmentation.
+    Calculate Aggregated Jaccard Index (AJI) for instance segmentation evaluation.
+    
+    AJI is a region-based metric designed specifically for instance segmentation tasks.
+    Unlike standard IoU which operates on pixel-level binary classification, AJI assesses
+    how well predicted object instances match the ground truth instances by:
+    1. Finding optimal one-to-one matching between predicted and ground truth instances
+    2. Computing the ratio of aggregated intersection to aggregated union across all matches
+    
+    The metric penalizes both false positive and false negative instances.
     
     Args:
-        pred_mask: Binary prediction mask (H, W)
-        true_mask: Ground truth instance mask (H, W) with unique IDs for each instance
+        pred_mask: Binary prediction mask or instance-labeled segmentation mask (H, W)
+        true_mask: Ground truth instance mask with unique IDs for each object instance (H, W)
     
     Returns:
-        AJI score (float)
+        AJI score [0,1] where higher values indicate better instance segmentation
     """
-    # Create instance segmentation from binary pred_mask using connected components
+    # Convert binary prediction to instance segmentation using connected components if needed
     if np.max(pred_mask) <= 1:  # If it's a binary mask
         labeled_pred = measure.label(pred_mask)
     else:
         labeled_pred = pred_mask.copy()
         
-    # Ground truth instances
+    # Process ground truth instance mask
     if np.max(true_mask) <= 1:  # If it's a binary mask (shouldn't be the case)
         print("Warning: Ground truth mask appears to be binary, not instance segmentation")
         labeled_true = measure.label(true_mask)
     else:
         labeled_true = true_mask.copy()
     
-    # Get unique instances (exclude background 0)
+    # Extract unique instance IDs excluding background (0)
     true_ids = np.unique(labeled_true)[1:]  # Skip background
     pred_ids = np.unique(labeled_pred)[1:]  # Skip background
     
+    # Handle edge cases of empty masks
     if len(true_ids) == 0 or len(pred_ids) == 0:
-        if len(true_ids) == len(pred_ids):  # Both empty
+        if len(true_ids) == len(pred_ids):  # Both empty (perfect match)
             return 1.0
-        else:  # One is empty, the other is not
+        else:  # One is empty, the other isn't (complete mismatch)
             return 0.0
     
-    # Compute IoU between each pair of predicted and true instances
+    # Compute IoU between all pairs of predicted and ground truth instances
     iou_matrix = np.zeros((len(true_ids), len(pred_ids)))
     
     for i, true_id in enumerate(true_ids):
@@ -62,20 +68,24 @@ def calculate_aji(pred_mask, true_mask):
         for j, pred_id in enumerate(pred_ids):
             pred_mask_j = (labeled_pred == pred_id)
             
-            # Calculate IoU
+            # Calculate standard IoU for this instance pair
             intersection = np.sum(np.logical_and(true_mask_i, pred_mask_j))
             union = np.sum(np.logical_or(true_mask_i, pred_mask_j))
             
             iou_matrix[i, j] = intersection / union if union > 0 else 0.0
     
-    # Find the best matching using the Hungarian algorithm
+    # Find optimal matching using the Hungarian algorithm
+    # (maximize total IoU by finding best assignment)
     true_indices, pred_indices = linear_sum_assignment(-iou_matrix)
     
-    # Calculate AJI
+    # Calculate AJI components
     numerator = 0
     denominator = 0
     
+    # Track matched predicted instances
     used_pred = set()
+    
+    # Process matched pairs
     for i, j in zip(true_indices, pred_indices):
         if iou_matrix[i, j] > 0:
             true_id = true_ids[i]
@@ -84,6 +94,7 @@ def calculate_aji(pred_mask, true_mask):
             true_mask_i = (labeled_true == true_id)
             pred_mask_j = (labeled_pred == pred_id)
             
+            # Add to aggregated intersection and union
             intersection = np.sum(np.logical_and(true_mask_i, pred_mask_j))
             union = np.sum(np.logical_or(true_mask_i, pred_mask_j))
             
@@ -92,50 +103,64 @@ def calculate_aji(pred_mask, true_mask):
             
             used_pred.add(pred_id)
     
-    # Add the remaining predictions to the denominator
+    # Add unmatched predictions to denominator (penalize false positives)
     for pred_id in pred_ids:
         if pred_id not in used_pred:
             pred_mask_j = (labeled_pred == pred_id)
             denominator += np.sum(pred_mask_j)
     
+    # Calculate final AJI
     aji = numerator / denominator if denominator > 0 else 0.0
     return aji
 
 def calculate_pq(pred_mask, true_mask, iou_threshold=0.5):
     """
-    Calculate Panoptic Quality (PQ) for instance segmentation.
+    Calculate Panoptic Quality (PQ) for instance segmentation evaluation.
+    
+    PQ is a unified metric for instance segmentation that measures both segmentation
+    quality and recognition quality. It is defined as:
+    
+    PQ = SQ × RQ
+    
+    where:
+    - SQ (Segmentation Quality): Average IoU of matched segments
+    - RQ (Recognition Quality): F1 score of the detection precision/recall
+    
+    The matching between predicted and ground truth instances is determined
+    using an IoU threshold, typically 0.5.
     
     Args:
-        pred_mask: Binary prediction mask (H, W)
-        true_mask: Ground truth instance mask (H, W) with unique IDs for each instance
-        iou_threshold: IoU threshold for true positive determination
+        pred_mask: Binary prediction mask or instance-labeled segmentation mask (H, W)
+        true_mask: Ground truth instance mask with unique IDs for each instance (H, W)
+        iou_threshold: IoU threshold for determining true positive matches (default: 0.5)
     
     Returns:
-        PQ score (float), with components SQ (Segmentation Quality) and RQ (Recognition Quality)
+        Dictionary containing PQ score and its components (SQ, RQ)
     """
-    # Create instance segmentation from binary pred_mask using connected components
+    # Convert binary prediction to instance segmentation using connected components if needed
     if np.max(pred_mask) <= 1:  # If it's a binary mask
         labeled_pred = measure.label(pred_mask)
     else:
         labeled_pred = pred_mask.copy()
     
-    # Ground truth instances
+    # Process ground truth instance mask
     if np.max(true_mask) <= 1:  # If it's a binary mask (shouldn't be the case)
         labeled_true = measure.label(true_mask)
     else:
         labeled_true = true_mask.copy()
     
-    # Get unique instances (exclude background 0)
+    # Extract unique instance IDs excluding background (0)
     true_ids = np.unique(labeled_true)[1:]  # Skip background
     pred_ids = np.unique(labeled_pred)[1:]  # Skip background
     
+    # Handle edge cases of empty masks
     if len(true_ids) == 0 and len(pred_ids) == 0:  # Both empty
         return {'PQ': 1.0, 'SQ': 1.0, 'RQ': 1.0}
     
-    if len(true_ids) == 0 or len(pred_ids) == 0:  # One is empty, the other is not
+    if len(true_ids) == 0 or len(pred_ids) == 0:  # One is empty, the other isn't
         return {'PQ': 0.0, 'SQ': 0.0, 'RQ': 0.0}
     
-    # Compute IoU between each pair of predicted and true instances
+    # Compute IoU between all pairs of predicted and ground truth instances
     iou_matrix = np.zeros((len(true_ids), len(pred_ids)))
     
     for i, true_id in enumerate(true_ids):
@@ -143,17 +168,17 @@ def calculate_pq(pred_mask, true_mask, iou_threshold=0.5):
         for j, pred_id in enumerate(pred_ids):
             pred_mask_j = (labeled_pred == pred_id)
             
-            # Calculate IoU
+            # Calculate standard IoU for this instance pair
             intersection = np.sum(np.logical_and(true_mask_i, pred_mask_j))
             union = np.sum(np.logical_or(true_mask_i, pred_mask_j))
             
             iou_matrix[i, j] = intersection / union if union > 0 else 0.0
     
-    # Find matches above threshold
+    # Identify matches based on IoU threshold
     true_matches = -np.ones(len(true_ids), dtype=int)
     pred_matches = -np.ones(len(pred_ids), dtype=int)
     
-    # Greedy matching based on IoU
+    # Greedy matching algorithm: match pairs with IoU above threshold
     for i in range(len(true_ids)):
         for j in range(len(pred_ids)):
             if iou_matrix[i, j] >= iou_threshold:
@@ -161,10 +186,10 @@ def calculate_pq(pred_mask, true_mask, iou_threshold=0.5):
                     true_matches[i] = j
                     pred_matches[j] = i
     
-    # Count statistics
-    tp = np.sum(true_matches >= 0)
-    fp = len(pred_ids) - tp
-    fn = len(true_ids) - tp
+    # Count statistical components for metrics
+    tp = np.sum(true_matches >= 0)  # True positives (matched instances)
+    fp = len(pred_ids) - tp       # False positives (extra predicted instances)
+    fn = len(true_ids) - tp       # False negatives (missed ground truth instances)
     
     # Calculate PQ metrics
     if tp == 0:
@@ -173,10 +198,10 @@ def calculate_pq(pred_mask, true_mask, iou_threshold=0.5):
     # Segmentation quality: average IoU of matched segments
     sq = np.mean([iou_matrix[i, true_matches[i]] for i in range(len(true_ids)) if true_matches[i] >= 0])
     
-    # Recognition quality: F1 score
+    # Recognition quality: F1 score of detection precision/recall
     rq = tp / (tp + 0.5 * fp + 0.5 * fn) if (tp + 0.5 * fp + 0.5 * fn) > 0 else 0.0
     
-    # Panoptic quality
+    # Final Panoptic Quality
     pq = sq * rq
     
     return {'PQ': pq, 'SQ': sq, 'RQ': rq}
